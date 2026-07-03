@@ -40,19 +40,21 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from make_hdf5 import create_hdf5  # noqa: E402  (sibling script, bundles pkls -> .h5)
 
 # --- The 20 non-ear TCP bipolar pairs, in TUH_Dataset.CHN_ORDER order (ears dropped). ---
-# Each value is the (anode, cathode) referential channel pair, in REF names (LE recordings
-# are renamed LE->REF first, so the same pairs apply to all four TUH montages).
+# Each value is (bipolar name, anode electrode, cathode electrode) using the BARE electrode
+# name (e.g. "FP1", "T3"). Channels are matched by electrode via _electrode() below, which
+# drops the "EEG " prefix and the "-REF"/"-LE" reference suffix -- robust to however MNE
+# surfaces the TUH labels, and montage-agnostic (AR/LE and their _a variants).
 BIPOLAR_PAIRS = [
-    ("FP1-F7", "EEG FP1-REF", "EEG F7-REF"), ("F7-T3", "EEG F7-REF", "EEG T3-REF"),
-    ("T3-T5", "EEG T3-REF", "EEG T5-REF"),   ("T5-O1", "EEG T5-REF", "EEG O1-REF"),
-    ("FP2-F8", "EEG FP2-REF", "EEG F8-REF"), ("F8-T4", "EEG F8-REF", "EEG T4-REF"),
-    ("T4-T6", "EEG T4-REF", "EEG T6-REF"),   ("T6-O2", "EEG T6-REF", "EEG O2-REF"),
-    ("T3-C3", "EEG T3-REF", "EEG C3-REF"),   ("C3-CZ", "EEG C3-REF", "EEG CZ-REF"),
-    ("CZ-C4", "EEG CZ-REF", "EEG C4-REF"),   ("C4-T4", "EEG C4-REF", "EEG T4-REF"),
-    ("FP1-F3", "EEG FP1-REF", "EEG F3-REF"), ("F3-C3", "EEG F3-REF", "EEG C3-REF"),
-    ("C3-P3", "EEG C3-REF", "EEG P3-REF"),   ("P3-O1", "EEG P3-REF", "EEG O1-REF"),
-    ("FP2-F4", "EEG FP2-REF", "EEG F4-REF"), ("F4-C4", "EEG F4-REF", "EEG C4-REF"),
-    ("C4-P4", "EEG C4-REF", "EEG P4-REF"),   ("P4-O2", "EEG P4-REF", "EEG O2-REF"),
+    ("FP1-F7", "FP1", "F7"), ("F7-T3", "F7", "T3"),
+    ("T3-T5", "T3", "T5"),   ("T5-O1", "T5", "O1"),
+    ("FP2-F8", "FP2", "F8"), ("F8-T4", "F8", "T4"),
+    ("T4-T6", "T4", "T6"),   ("T6-O2", "T6", "O2"),
+    ("T3-C3", "T3", "C3"),   ("C3-CZ", "C3", "CZ"),
+    ("CZ-C4", "CZ", "C4"),   ("C4-T4", "C4", "T4"),
+    ("FP1-F3", "FP1", "F3"), ("F3-C3", "F3", "C3"),
+    ("C3-P3", "C3", "P3"),   ("P3-O1", "P3", "O1"),
+    ("FP2-F4", "FP2", "F4"), ("F4-C4", "F4", "C4"),
+    ("C4-P4", "C4", "P4"),   ("P4-O2", "P4", "O2"),
 ]
 N_BIPOLAR = len(BIPOLAR_PAIRS)  # 20
 SFREQ = 256
@@ -60,17 +62,23 @@ WINDOW_SAMPLES = 5 * SFREQ      # 5 s at 256 Hz -> 1280
 COHORT_LABEL = {"00_epilepsy": 1, "01_no_epilepsy": 0}
 
 
+def _electrode(ch_name: str) -> str:
+    """Bare electrode name from a raw EDF label (mirrors the engine's _rename_channels):
+    drop the 'EEG ' prefix and the '-REF'/'-LE' suffix, case/space-insensitive.
+    'EEG FP1-REF' / 'FP1-REF' / 'Fp1' -> 'FP1'."""
+    return ch_name.upper().replace("EEG ", "").replace("-REF", "").replace("-LE", "").strip()
+
+
 def make_bipolar_20(raw):
     """(20, T) float array in CHN_ORDER[:20] order, or None if any of the 20 pairs is
-    underivable (a required referential channel is absent)."""
-    names = raw.ch_names
+    underivable (a required electrode is absent)."""
     data = raw.get_data(units="uV")
-    idx = {n: i for i, n in enumerate(names)}
+    idx = {_electrode(n): i for i, n in enumerate(raw.ch_names)}
     out = []
-    for _name, ch1, ch2 in BIPOLAR_PAIRS:
-        if ch1 not in idx or ch2 not in idx:
+    for _name, e1, e2 in BIPOLAR_PAIRS:
+        if e1 not in idx or e2 not in idx:
             return None
-        out.append(data[idx[ch1]] - data[idx[ch2]])
+        out.append(data[idx[e1]] - data[idx[e2]])
     return np.asarray(out, dtype=np.float32)
 
 
@@ -80,14 +88,15 @@ def process_and_dump_file(params):
     stem = os.path.basename(file_path).split(".")[0]
     try:
         raw = mne.io.read_raw_edf(file_path, preload=True, verbose=False)
-        if any("-LE" in ch for ch in raw.ch_names):
-            raw.rename_channels(lambda x: x.replace("-LE", "-REF"))
-        # keep only the referential channels the bipolar montage needs (relaxed: '_a'
-        # montages are missing the ear channels, which we do not use anyway)
-        needed = {c for _n, a, b in BIPOLAR_PAIRS for c in (a, b)}
-        present = [c for c in raw.ch_names if c in needed]
-        if len(present) < len(needed):
-            raise ValueError(f"missing referential channels ({len(present)}/{len(needed)})")
+        # Keep the referential channels the bipolar montage needs, matched by electrode name
+        # (so the exact TUH label format / EEG prefix does not matter). '_a' montages just
+        # lack the ear channels, which we do not use.
+        needed = {e for _n, a, b in BIPOLAR_PAIRS for e in (a, b)}
+        present = [c for c in raw.ch_names if _electrode(c) in needed]
+        found = {_electrode(c) for c in present}
+        if len(found) < len(needed):
+            raise ValueError(f"missing referential channels ({len(found)}/{len(needed)}); "
+                             f"channels seen: {raw.ch_names[:25]}")
         raw.pick(present)
 
         # Drop recordings shorter than min_duration_s (native rate, before filtering): the
