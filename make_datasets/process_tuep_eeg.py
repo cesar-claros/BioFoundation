@@ -76,7 +76,7 @@ def make_bipolar_20(raw):
 
 def process_and_dump_file(params):
     """Worker: preprocess one EDF and dump its 5 s windows as pickles."""
-    file_path, dump_folder, label, max_windows = params
+    file_path, dump_folder, label, max_windows, min_duration_s = params
     stem = os.path.basename(file_path).split(".")[0]
     try:
         raw = mne.io.read_raw_edf(file_path, preload=True, verbose=False)
@@ -88,7 +88,13 @@ def process_and_dump_file(params):
         present = [c for c in raw.ch_names if c in needed]
         if len(present) < len(needed):
             raise ValueError(f"missing referential channels ({len(present)}/{len(needed)})")
-        raw.pick_channels(present, ordered=False)
+        raw.pick(present)
+
+        # Drop recordings shorter than min_duration_s (native rate, before filtering): the
+        # 0.1 Hz high-pass needs a ~68 s FIR filter, so shorter signals get edge distortion
+        # (RuntimeWarning "filter_length ... longer than the signal").
+        if min_duration_s and raw.n_times / float(raw.info["sfreq"]) < min_duration_s:
+            return
 
         raw.filter(l_freq=0.1, h_freq=75.0, verbose=False)
         raw.notch_filter(60, verbose=False)
@@ -165,6 +171,9 @@ def main():
     parser.add_argument("--processes", type=int, default=24, help="Parallel worker processes (default 24).")
     parser.add_argument("--interictal", action="store_true", help="Drop recordings with a seizure annotation (.csv_bi 'seiz'); diagnosis task.")
     parser.add_argument("--max_windows_per_recording", type=int, default=None, help="Cap 5 s windows per recording (default: all).")
+    parser.add_argument("--min_duration_s", type=float, default=0.0,
+                        help="Drop recordings shorter than this many seconds (0 = keep all). Use ~70+ to avoid the "
+                        "0.1 Hz filter distorting short recordings; e.g. 120 for >= 2 min.")
     parser.add_argument("--seed", type=int, default=42, help="Subject-split seed (default 42).")
     parser.add_argument("--keep_pkl", action="store_true", help="Keep the intermediate .pkl files after building the .h5 files.")
     args = parser.parse_args()
@@ -184,7 +193,8 @@ def main():
           f"(train {len(splits['train'])}, val {len(splits['val'])}, test {len(splits['test'])})")
 
     params = [
-        (str(edf), os.path.join(proc, subj_to_split[subject]), label, args.max_windows_per_recording)
+        (str(edf), os.path.join(proc, subj_to_split[subject]), label,
+         args.max_windows_per_recording, args.min_duration_s)
         for edf, subject, label in recs
     ]
     print(f"Processing {len(params)} recordings with {args.processes} processes...")
