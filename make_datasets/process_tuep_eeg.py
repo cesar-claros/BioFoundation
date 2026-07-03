@@ -18,6 +18,14 @@
 #*       --root_dir /path/to/tuh_eeg_epilepsy/v3.0.0 \
 #*       --output_dir /path/to/processed_eeg [--interictal] [--processes 24]
 #*
+#* Balance the splits by capping windows PER SUBJECT (so a few patients with many
+#* recordings do not dominate; the budget is spread evenly across each subject's
+#* recordings), and optionally reuse a HYDRA run's subject-level split so the held-out
+#* subjects match for an apples-to-apples LuMamba-vs-HYDRA comparison:
+#*   python make_datasets/process_tuep_eeg.py --root_dir ... --output_dir ... \
+#*       --interictal --min_duration_s 120 --max_windows_per_subject 200 \
+#*       --hydra_windows_dir /path/to/tuh-eeg-epilepsy/logs/train/runs/<timestamp>
+#*
 #* Then point config/experiment/LuMamba_finetune.yaml at:
 #*   data_module.{train,val,test}._target_: datasets.tuh_dataset.TUH_Dataset
 #*   data_module.{train,val,test}.hdf5_file:  <output_dir>/TUEP_data/{train,val,test}.h5
@@ -29,6 +37,7 @@ import os
 import pickle
 import shutil
 import sys
+from collections import Counter, defaultdict
 from multiprocessing import Pool
 from pathlib import Path
 
@@ -179,6 +188,64 @@ def split_subjects(recs, seed, ratios=(0.6, 0.2, 0.2)):
     return splits
 
 
+def load_hydra_split(windows_dir):
+    """subject -> split from a HYDRA run's windows_{train,val,test}.csv 'subject' column.
+
+    Reuses the exact subject-level split of a finished HYDRA run so LuMamba is trained
+    and evaluated on the same held-out patients (apples-to-apples). The window CSVs list
+    one row per window; we only need the unique subject IDs per split, which are the
+    corpus subject-folder names, matching collect_recordings' ``subject``.
+    """
+    windows_dir = Path(windows_dir)
+    subj_to_split = {}
+    for split in ("train", "val", "test"):
+        csv_path = windows_dir / f"windows_{split}.csv"
+        if not csv_path.exists():
+            raise SystemExit(f"HYDRA split CSV not found: {csv_path}")
+        subs = pd.read_csv(csv_path, usecols=["subject"])["subject"].astype(str).unique()
+        for s in subs:
+            prev = subj_to_split.get(s)
+            if prev is not None and prev != split:
+                print(f"!! subject {s} appears in both '{prev}' and '{split}'; keeping '{prev}'.")
+                continue
+            subj_to_split[s] = split
+    return subj_to_split
+
+
+def per_recording_caps(recs, max_per_subject, max_per_recording):
+    """Map each recording's EDF path to its window cap (int, or None = unlimited).
+
+    A per-SUBJECT budget (``max_per_subject``) is distributed as evenly as possible over
+    that subject's recordings: ``base = budget // n_rec`` windows each, and the first
+    ``budget % n_rec`` recordings (ordered by path, so the choice is deterministic) get
+    one extra. The per-recording caps therefore sum to exactly the budget, so a subject
+    with many recordings no longer floods the pool (each of its recordings contributes
+    only ``~budget / n_rec`` windows, possibly 0). A per-recording ceiling
+    (``max_per_recording``) is then applied on top, the smaller of the two winning. With
+    neither set, the cap is None (all windows are kept).
+    """
+    by_subject = defaultdict(list)
+    for edf, subject, _label in recs:
+        by_subject[subject].append(str(edf))
+    caps = {}
+    for paths in by_subject.values():
+        paths = sorted(paths)
+        n = len(paths)
+        if max_per_subject is not None:
+            base, extra = divmod(max_per_subject, n)
+            sub_caps = [base + (1 if i < extra else 0) for i in range(n)]
+        else:
+            sub_caps = [None] * n
+        for path, sub_cap in zip(paths, sub_caps):
+            if sub_cap is None:
+                caps[path] = max_per_recording
+            elif max_per_recording is None:
+                caps[path] = sub_cap
+            else:
+                caps[path] = min(sub_cap, max_per_recording)
+    return caps
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--root_dir", required=True, help="Path to the TUH EEG Epilepsy v3.0.0 dir (has 00_epilepsy / 01_no_epilepsy).")
@@ -186,6 +253,17 @@ def main():
     parser.add_argument("--processes", type=int, default=24, help="Parallel worker processes (default 24).")
     parser.add_argument("--interictal", action="store_true", help="Drop recordings with a seizure annotation (.csv_bi 'seiz'); diagnosis task.")
     parser.add_argument("--max_windows_per_recording", type=int, default=None, help="Cap 5 s windows per recording (default: all).")
+    parser.add_argument("--max_windows_per_subject", type=int, default=None,
+                        help="Cap total 5 s windows per SUBJECT, spread evenly across that subject's recordings "
+                        "(mirrors the HYDRA max_windows_per_subject). Keeps a handful of patients with many "
+                        "recordings from dominating, so the window counts track the 60/20/20 subject split "
+                        "instead of ballooning wherever the high-recording subjects land. Combined with "
+                        "--max_windows_per_recording via the smaller cap.")
+    parser.add_argument("--hydra_windows_dir", default=None,
+                        help="Directory of a finished HYDRA run holding windows_{train,val,test}.csv. If given, "
+                        "reuse that run's subject-level split (identical held-out patients for an apples-to-apples "
+                        "LuMamba-vs-HYDRA comparison) instead of the seed split; pool subjects absent from those "
+                        "CSVs are added to train, and HYDRA subjects absent from this pool are reported.")
     parser.add_argument("--min_duration_s", type=float, default=0.0,
                         help="Drop recordings shorter than this many seconds (0 = keep all). Use ~70+ to avoid the "
                         "0.1 Hz filter distorting short recordings; e.g. 120 for >= 2 min.")
@@ -205,14 +283,33 @@ def main():
     recs = collect_recordings(root_dir, args.interictal)
     if not recs:
         raise SystemExit(f"No EDF recordings found under {root_dir}.")
-    splits = split_subjects(recs, args.seed)
-    subj_to_split = {s: sp for sp, subs in splits.items() for s in subs}
-    print(f"Recordings: {len(recs)} | subjects: {len(subj_to_split)} "
-          f"(train {len(splits['train'])}, val {len(splits['val'])}, test {len(splits['test'])})")
 
+    pool_subjects = {subject for _edf, subject, _label in recs}
+    if args.hydra_windows_dir:
+        hydra_map = load_hydra_split(args.hydra_windows_dir)
+        subj_to_split = {}
+        leftovers = []
+        for s in sorted(pool_subjects):
+            if s in hydra_map:
+                subj_to_split[s] = hydra_map[s]
+            else:
+                subj_to_split[s] = "train"
+                leftovers.append(s)
+        missing = Counter(sp for s, sp in hydra_map.items() if s not in pool_subjects)
+        print(f"Aligned split to HYDRA windows in {args.hydra_windows_dir}: "
+              f"{len(hydra_map)} mapped subjects, {len(leftovers)} pool subjects not in HYDRA -> train, "
+              f"{sum(missing.values())} HYDRA subjects absent from this pool {dict(missing)}.")
+    else:
+        splits = split_subjects(recs, args.seed)
+        subj_to_split = {s: sp for sp, subs in splits.items() for s in subs}
+    split_subj_counts = Counter(subj_to_split.values())
+    print(f"Recordings: {len(recs)} | subjects: {len(subj_to_split)} "
+          f"(train {split_subj_counts['train']}, val {split_subj_counts['val']}, test {split_subj_counts['test']})")
+
+    caps = per_recording_caps(recs, args.max_windows_per_subject, args.max_windows_per_recording)
     params = [
         (str(edf), os.path.join(proc, subj_to_split[subject]), label,
-         args.max_windows_per_recording, args.min_duration_s)
+         caps[str(edf)], args.min_duration_s)
         for edf, subject, label in recs
     ]
     print(f"Processing {len(params)} recordings with {args.processes} processes...")
