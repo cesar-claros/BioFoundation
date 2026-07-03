@@ -147,6 +147,11 @@ def collect_recordings(root_dir: Path, interictal: bool):
             print(f"!! cohort dir not found: {cohort_dir}")
             continue
         for edf in sorted(cohort_dir.rglob("*.edf")):
+            # Only raw recordings: <subject>_s<session>_t<recording>.edf. Skip derived EDFs
+            # such as the HYDRA pipeline's <...>_ica.edf (IC-source channels, not electrodes).
+            last = edf.stem.rsplit("_", 1)[-1]
+            if not (last.startswith("t") and last[1:].isdigit()):
+                continue
             subject = edf.relative_to(cohort_dir).parts[0]
             if interictal and _has_seizure(edf):
                 continue
