@@ -27,6 +27,7 @@
 import argparse
 import os
 import pickle
+import shutil
 import sys
 from multiprocessing import Pool
 from pathlib import Path
@@ -195,6 +196,9 @@ def main():
     root_dir = Path(args.root_dir)
     base = os.path.join(args.output_dir, "TUEP_data")
     proc = os.path.join(base, "processed")
+    # Start clean: drop any pkls left by a previous (interrupted or differently-configured)
+    # run so stale/partial windows are never bundled into the HDF5s.
+    shutil.rmtree(proc, ignore_errors=True)
     for split in ("train", "val", "test"):
         os.makedirs(os.path.join(proc, split), exist_ok=True)
 
@@ -220,7 +224,6 @@ def main():
         tgt = os.path.join(base, f"{split}.h5")
         create_hdf5(src, tgt, finetune=True)
     if not args.keep_pkl:
-        import shutil
         shutil.rmtree(proc, ignore_errors=True)
     print(f"Done. HDF5 at {base}/{{train,val,test}}.h5 "
           f"(X: (N, {N_BIPOLAR}, {WINDOW_SAMPLES}), y: 0/1). Set num_channels=20 in the finetune data_module.")
