@@ -38,7 +38,20 @@ classification_type: "bc"
 # Change for different tasks: "mcc" for multi-class classification and regression tasks, "bc" for binary classification.
 
 pretrained_checkpoint_path: null
-pretrained_safetensors_path: null
+# Pretrained LuMamba variant to finetune from. All four downloaded checkpoints (under
+# ${CHECKPOINT_DIR}/LuMamba) are registered below; pick one with `pretrained_variant=<name>`
+# on the CLI. Default is mixed_300 (LeJEPA + reconstruction, 300 slices).
+#   reconstruction_only : masked-reconstruction pretraining only
+#   lejepa_only_128     : LeJEPA pretraining only, 128 slices
+#   mixed_128           : LeJEPA + reconstruction, 128 slices
+#   mixed_300           : LeJEPA + reconstruction, 300 slices
+pretrained_variant: mixed_300
+_pretrained_paths:
+  reconstruction_only: ${env:CHECKPOINT_DIR}/LuMamba/LuMamba_ReconstructionOnly.safetensors
+  lejepa_only_128: ${env:CHECKPOINT_DIR}/LuMamba/LuMamba_LeJEPAOnly_128slices.safetensors
+  mixed_128: ${env:CHECKPOINT_DIR}/LuMamba/LuMamba_LeJEPA_reconstruction_128slices.safetensors
+  mixed_300: ${env:CHECKPOINT_DIR}/LuMamba/LuMamba_LeJEPA_reconstruction_300slices.safetensors
+pretrained_safetensors_path: ${_pretrained_paths.${pretrained_variant}}
 
 callbacks:
   progress_bar:
@@ -67,26 +80,28 @@ defaults:
   - override /data_module: finetune_data_module 
   - override /model: LuMamba_tiny
   - override /scheduler: cosine
-  - override /task: "#CHANGEME" # override with "finetune_task_LUNA" for classification and "finetune_regression_task_LuMamba" for regression tasks
+  - override /task: finetune_task_LUNA # binary classification (epilepsy vs no-epilepsy); use finetune_regression_task_LuMamba for regression
   - override /criterion: finetune_criterion
 
-# Change _target_ to corresponding dataset wrapper for finetuning dataset
+# TUEP HDF5s from make_datasets/process_tuep_eeg.py. num_channels=20 is REQUIRED: the X
+# arrays are the 20 non-ear TCP bipolar channels (CHN_ORDER[:20]); leaving it null makes
+# TUH_Dataset build 22 channel embeddings against 20-channel data and mismatch.
 data_module:
   train:
-    _target_: 'datasets.#CHANGEME.#CHANGEME'
-    hdf5_file: '#CHANGEME' # path to finetuning dataset training split
+    _target_: 'datasets.tuh_dataset.TUH_Dataset'
+    hdf5_file: '/work/cniel/sw/singularity_containers/tuh-eeg-epilepsy/BioFoundation/TUEP_data/train.h5'
+    num_channels: 20
     finetune: True
-    # channel_subset: False # applicable to MoBI and MODMA datasets; set to True to use a subset of the channels
   val:
-    _target_: 'datasets.#CHANGEME.#CHANGEME'
-    hdf5_file: '#CHANGEME' # path to finetuning dataset validation split
+    _target_: 'datasets.tuh_dataset.TUH_Dataset'
+    hdf5_file: '/work/cniel/sw/singularity_containers/tuh-eeg-epilepsy/BioFoundation/TUEP_data/val.h5'
+    num_channels: 20
     finetune: True
-    # channel_subset: False # applicable to MoBI and MODMA datasets; set to True to use a subset of the channels
-  test: 
-    _target_: 'datasets.#CHANGEME.#CHANGEME'
-    hdf5_file: '#CHANGEME' # path to finetuning dataset test split
+  test:
+    _target_: 'datasets.tuh_dataset.TUH_Dataset'
+    hdf5_file: '/work/cniel/sw/singularity_containers/tuh-eeg-epilepsy/BioFoundation/TUEP_data/test.h5'
+    num_channels: 20
     finetune: True
-    # channel_subset: False # applicable to MoBI and MODMA datasets; set to True to use a subset of the channels
 
 model:
   num_classes: 2 # Change for corresponding finetuning dataset
