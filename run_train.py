@@ -45,6 +45,18 @@ for env_var in ["DATA_PATH", "CHECKPOINT_DIR"]:
 OmegaConf.register_new_resolver("env", lambda key: os.getenv(key))
 OmegaConf.register_new_resolver("get_method", hydra.utils.get_method)
 
+# PyTorch 2.6 flipped torch.load's default to weights_only=True, which refuses to unpickle the
+# OmegaConf ListConfig/DictConfig objects Lightning stores in the checkpoint hyper_parameters
+# (raises "Unsupported global: omegaconf.listconfig.ListConfig") when this script reloads its
+# own checkpoints on fit-resume / final validate / test. Those .ckpt files are produced here
+# (trusted), and the pretrained weights load via safetensors (not torch.load), so restore the
+# pre-2.6 behavior by forcing weights_only=False for the Lightning checkpoint reloads.
+_torch_load_orig = torch.load
+def _torch_load_full(*args, **kwargs):
+    kwargs["weights_only"] = False
+    return _torch_load_orig(*args, **kwargs)
+torch.load = _torch_load_full
+
 logger: Logger = logging.getLogger(__name__)
 
 # Set float32 matmul precision to high for better performance on supported hardware
