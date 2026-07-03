@@ -89,17 +89,17 @@ defaults:
 data_module:
   train:
     _target_: 'datasets.tuh_dataset.TUH_Dataset'
-    hdf5_file: '/work/cniel/sw/singularity_containers/tuh-eeg-epilepsy/BioFoundation/TUEP_data/train.h5'
+    hdf5_file: ${env:DATA_PATH}/TUEP_data/train.h5
     num_channels: 20
     finetune: True
   val:
     _target_: 'datasets.tuh_dataset.TUH_Dataset'
-    hdf5_file: '/work/cniel/sw/singularity_containers/tuh-eeg-epilepsy/BioFoundation/TUEP_data/val.h5'
+    hdf5_file: ${env:DATA_PATH}/TUEP_data/val.h5
     num_channels: 20
     finetune: True
   test:
     _target_: 'datasets.tuh_dataset.TUH_Dataset'
-    hdf5_file: '/work/cniel/sw/singularity_containers/tuh-eeg-epilepsy/BioFoundation/TUEP_data/test.h5'
+    hdf5_file: ${env:DATA_PATH}/TUEP_data/test.h5
     num_channels: 20
     finetune: True
 
