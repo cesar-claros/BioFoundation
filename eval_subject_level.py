@@ -83,10 +83,15 @@ def _decode(s):
 
 @hydra.main(config_path="./config", config_name="defaults", version_base="1.1")
 def run(cfg: DictConfig):
-    ckpt_path = cfg.get("eval_checkpoint", None)
-    if ckpt_path is None:
-        raise SystemExit("Pass the finetuned checkpoint: +eval_checkpoint=/abs/path/to/best.ckpt")
-    split = cfg.get("eval_split", "test")
+    # Lightning names checkpoints 'epoch=..-step=...ckpt'; the '=' breaks Hydra's override
+    # parser, so also accept the path from the EVAL_CHECKPOINT env var (shell-safe, no quoting).
+    ckpt_path = cfg.get("eval_checkpoint", None) or os.getenv("EVAL_CHECKPOINT")
+    if not ckpt_path:
+        raise SystemExit(
+            "Pass the finetuned checkpoint via EVAL_CHECKPOINT=/abs/path (recommended: the '=' in "
+            "Lightning ckpt names trips Hydra) or +eval_checkpoint='/abs/path/best.ckpt'."
+        )
+    split = cfg.get("eval_split", None) or os.getenv("EVAL_SPLIT", "test")
     hdf5_file = cfg.data_module[split].hdf5_file
     num_channels = int(cfg.data_module[split].get("num_channels", 20))
     batch = int(cfg.get("eval_batch_size", cfg.get("batch_size", 512)))
@@ -116,6 +121,17 @@ def run(cfg: DictConfig):
                 f"{hdf5_file} has no per-window 'subject' dataset. Regenerate the split with the "
                 "updated process_tuep_eeg.py + make_hdf5.py so subject ids are stored."
             )
+        # The channel cross-attention runs a TransformerEncoder over (B*num_patches, C, E); its
+        # fused CUDA kernel caps the grid at 65535, so B*num_patches must stay under that or the
+        # forward dies with "CUDA error: invalid configuration argument". Shrink the batch for
+        # long windows (num_patches = T // patch_size, patch_size=40) so eval works at any length.
+        if keys:
+            t_samples = int(d[keys[0]]["X"].shape[-1])
+            num_patches = max(1, t_samples // 40)
+            safe = max(1, min(batch, 60000 // num_patches))
+            if safe < batch:
+                print(f"     reducing eval batch {batch} -> {safe} ({num_patches} patches/window, CUDA grid cap)")
+            batch = safe
         for k in keys:
             grp = d[k]
             X_all, y_all, subj_all = grp["X"], grp["y"][:], grp["subject"][:]
@@ -136,9 +152,13 @@ def run(cfg: DictConfig):
     y = np.concatenate(ys).astype(int)
     subj = np.array([_decode(s) for s in np.concatenate(subjects)])
 
+    win_m = _metrics(y, prob)
     print(f"\n=== {split.upper()} WINDOW-LEVEL (n={len(y)} windows) ===")
-    for kk, vv in _metrics(y, prob).items():
+    for kk, vv in win_m.items():
         print(f"  {kk:14s} {vv:.4f}")
+    # Machine-readable line for the sweep orchestrator (grep 'RESULT ... level=window').
+    print("RESULT split={} level=window n={} {}".format(
+        split, len(y), " ".join(f"{k}={v:.4f}" for k, v in win_m.items())))
 
     # Subject-level: mean epilepsy probability per subject; label is constant within subject.
     by_prob, by_lab = defaultdict(list), {}
@@ -150,11 +170,14 @@ def run(cfg: DictConfig):
     s_true = np.array([by_lab[s] for s in subj_ids])
     n_pos = int(s_true.sum())
     win_per_subj = np.array([len(by_prob[s]) for s in subj_ids])
+    subj_m = _metrics(s_true, s_prob)
     print(f"\n=== {split.upper()} SUBJECT-LEVEL (n={len(subj_ids)} subjects: "
           f"{n_pos} epilepsy / {len(subj_ids) - n_pos} no-epilepsy; "
           f"{win_per_subj.min()}-{win_per_subj.max()} windows/subject, mean-prob aggregation) ===")
-    for kk, vv in _metrics(s_true, s_prob).items():
+    for kk, vv in subj_m.items():
         print(f"  {kk:14s} {vv:.4f}")
+    print("RESULT split={} level=subject n={} {}".format(
+        split, len(subj_ids), " ".join(f"{k}={v:.4f}" for k, v in subj_m.items())))
 
 
 if __name__ == "__main__":
