@@ -1,0 +1,9 @@
+seed,variant,mode,split,level,n,window_s,auroc,avg_precision,balanced_acc,accuracy,sensitivity,specificity,f1,cohen_kappa
+0,mixed_300,frozen,test,window,4204,30.0,0.6787,0.8115,0.6003,0.6632,0.7788,0.4217,0.7577,0.2068
+0,mixed_300,frozen,test,subject,40,30.0,0.65,0.6529,0.55,0.55,0.8,0.3,0.64,0.1
+0,mixed_300,frozen,val,window,3676,30.0,0.5761,0.7171,0.5434,0.6243,0.7981,0.2887,0.7368,0.0941
+0,mixed_300,frozen,val,subject,40,30.0,0.6325,0.6472,0.525,0.525,0.9,0.15,0.6545,0.05
+0,mixed_300,full,test,window,4204,30.0,0.7091,0.8241,0.6355,0.6858,0.7781,0.493,0.7701,0.2742
+0,mixed_300,full,test,subject,40,30.0,0.6825,0.7073,0.625,0.625,0.85,0.4,0.6939,0.25
+0,mixed_300,full,val,window,3676,30.0,0.6349,0.7691,0.5783,0.6445,0.7865,0.37,0.7446,0.1652
+0,mixed_300,full,val,subject,40,30.0,0.7275,0.6368,0.65,0.65,1.0,0.3,0.7407,0.3
