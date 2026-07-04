@@ -74,7 +74,20 @@ def create_hdf5(source_dir, target_file, finetune=True,group_size=1000):
                         except Exception as e:
                              print(f"Error packing y data for group {i // group_size}: {e}")
                              del h5f[f"data_group_{i // group_size}"]
-                    
+
+                    # Optional per-window subject id (present when the producer stores it, e.g.
+                    # process_tuep_eeg.py). Kept backward compatible: only packed if the samples
+                    # carry a 'subject', so datasets without it are unaffected. Enables
+                    # subject-level aggregation at eval time (the X/y arrays alone lose which
+                    # windows belong to which patient).
+                    gname = f"data_group_{i // group_size}"
+                    if gname in h5f and 'subject' in data_group[0]:
+                        try:
+                            subj_data = np.array([str(s.get('subject', '')) for s in data_group], dtype=object)
+                            h5f[gname].create_dataset("subject", data=subj_data, dtype=h5py.string_dtype())
+                        except Exception as e:
+                            print(f"Error packing subject data for group {i // group_size}: {e}")
+
                     data_group = []
 
 def process_dataset(prepath, dataset_name, splits, finetune, remove_pkl):

@@ -94,7 +94,7 @@ def make_bipolar_20(raw):
 
 def process_and_dump_file(params):
     """Worker: preprocess one EDF and dump its 5 s windows as pickles."""
-    file_path, dump_folder, label, max_windows, min_duration_s = params
+    file_path, dump_folder, label, subject, max_windows, min_duration_s = params
     stem = os.path.basename(file_path).split(".")[0]
     try:
         raw = mne.io.read_raw_edf(file_path, preload=True, verbose=False)
@@ -130,7 +130,7 @@ def process_and_dump_file(params):
         for i in range(n_win):
             seg = data[:, i * WINDOW_SAMPLES:(i + 1) * WINDOW_SAMPLES]
             with open(os.path.join(dump_folder, f"{stem}_{i}.pkl"), "wb") as f:
-                pickle.dump({"X": seg, "y": int(label)}, f)
+                pickle.dump({"X": seg, "y": int(label), "subject": subject}, f)
     except Exception as e:  # noqa: BLE001
         with open("tuep-process-errors.txt", "a") as f:
             f.write(f"Error processing {file_path}: {e}\n")
@@ -308,7 +308,7 @@ def main():
 
     caps = per_recording_caps(recs, args.max_windows_per_subject, args.max_windows_per_recording)
     params = [
-        (str(edf), os.path.join(proc, subj_to_split[subject]), label,
+        (str(edf), os.path.join(proc, subj_to_split[subject]), label, subject,
          caps[str(edf)], args.min_duration_s)
         for edf, subject, label in recs
     ]
