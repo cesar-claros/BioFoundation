@@ -5,7 +5,8 @@
 #* EEG Epilepsy corpus and to feed the LuMamba / LUNA finetune dataset (datasets.tuh_dataset.
 #* TUH_Dataset). Per recording: read EDF -> rename LE->REF -> band-pass 0.1-75 Hz -> notch
 #* 60 Hz -> resample 256 Hz -> TCP bipolar (the 20 NON-ear pairs, in CHN_ORDER order) ->
-#* 5 s windows -> one {"X": (20, 1280), "y": label} pickle per window. Label is per-patient
+#* fixed-length windows (--window_s, default 5 s -> (20, 1280)) -> one {"X", "y", "subject"}
+#* pickle per window. Label is per-patient
 #* diagnosis: epilepsy (00_epilepsy) = 1, no-epilepsy (01_no_epilepsy) = 0. Then the pickles
 #* are bundled into TUEP_data/{train,val,test}.h5 with the shared make_hdf5.create_hdf5.
 #*
@@ -68,7 +69,7 @@ BIPOLAR_PAIRS = [
 ]
 N_BIPOLAR = len(BIPOLAR_PAIRS)  # 20
 SFREQ = 256
-WINDOW_SAMPLES = 5 * SFREQ      # 5 s at 256 Hz -> 1280
+DEFAULT_WINDOW_S = 5.0          # 5 s at 256 Hz -> 1280 samples (LuMamba's pretraining window)
 COHORT_LABEL = {"00_epilepsy": 1, "01_no_epilepsy": 0}
 
 
@@ -93,8 +94,8 @@ def make_bipolar_20(raw):
 
 
 def process_and_dump_file(params):
-    """Worker: preprocess one EDF and dump its 5 s windows as pickles."""
-    file_path, dump_folder, label, subject, max_windows, min_duration_s = params
+    """Worker: preprocess one EDF and dump its fixed-length windows as pickles."""
+    file_path, dump_folder, label, subject, max_windows, min_duration_s, window_samples = params
     stem = os.path.basename(file_path).split(".")[0]
     try:
         raw = mne.io.read_raw_edf(file_path, preload=True, verbose=False)
@@ -124,11 +125,11 @@ def process_and_dump_file(params):
         if data is None or data.shape[0] != N_BIPOLAR:
             raise ValueError("could not build the 20 bipolar channels")
         n_times = data.shape[1]
-        n_win = n_times // WINDOW_SAMPLES
+        n_win = n_times // window_samples
         if max_windows is not None:
             n_win = min(n_win, max_windows)
         for i in range(n_win):
-            seg = data[:, i * WINDOW_SAMPLES:(i + 1) * WINDOW_SAMPLES]
+            seg = data[:, i * window_samples:(i + 1) * window_samples]
             with open(os.path.join(dump_folder, f"{stem}_{i}.pkl"), "wb") as f:
                 pickle.dump({"X": seg, "y": int(label), "subject": subject}, f)
     except Exception as e:  # noqa: BLE001
@@ -268,8 +269,18 @@ def main():
                         help="Drop recordings shorter than this many seconds (0 = keep all). Use ~70+ to avoid the "
                         "0.1 Hz filter distorting short recordings; e.g. 120 for >= 2 min.")
     parser.add_argument("--seed", type=int, default=42, help="Subject-split seed (default 42).")
+    parser.add_argument("--window_s", type=float, default=DEFAULT_WINDOW_S,
+                        help="Window length in seconds (default 5 = LuMamba's pretraining window). Longer windows "
+                        "give the model more temporal context (HYDRA uses 30-120 s); LuMamba is Mamba-based and "
+                        "length-flexible, tokenizing T//40 samples into patches. Use a multiple of 5 s so T stays "
+                        "divisible by the patch size (5 s=32 patches, 30 s=192, 60 s=384). Set --min_duration_s "
+                        ">= this. Longer windows need a smaller finetune batch_size (more patches = more memory).")
     parser.add_argument("--keep_pkl", action="store_true", help="Keep the intermediate .pkl files after building the .h5 files.")
     args = parser.parse_args()
+    window_samples = int(round(args.window_s * SFREQ))
+    if args.min_duration_s and args.min_duration_s < args.window_s:
+        print(f"!! --min_duration_s ({args.min_duration_s}) < --window_s ({args.window_s}); "
+              "recordings shorter than one window yield 0 windows.")
 
     root_dir = Path(args.root_dir)
     base = os.path.join(args.output_dir, "TUEP_data")
@@ -309,7 +320,7 @@ def main():
     caps = per_recording_caps(recs, args.max_windows_per_subject, args.max_windows_per_recording)
     params = [
         (str(edf), os.path.join(proc, subj_to_split[subject]), label, subject,
-         caps[str(edf)], args.min_duration_s)
+         caps[str(edf)], args.min_duration_s, window_samples)
         for edf, subject, label in recs
     ]
     print(f"Processing {len(params)} recordings with {args.processes} processes...")
@@ -323,7 +334,8 @@ def main():
     if not args.keep_pkl:
         shutil.rmtree(proc, ignore_errors=True)
     print(f"Done. HDF5 at {base}/{{train,val,test}}.h5 "
-          f"(X: (N, {N_BIPOLAR}, {WINDOW_SAMPLES}), y: 0/1). Set num_channels=20 in the finetune data_module.")
+          f"(X: (N, {N_BIPOLAR}, {window_samples}) = {args.window_s:g}s windows, y: 0/1). "
+          "Set num_channels=20 in the finetune data_module.")
 
 
 if __name__ == "__main__":
