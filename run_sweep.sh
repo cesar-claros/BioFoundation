@@ -15,7 +15,7 @@
 set -euo pipefail
 
 # ---- paths (EDIT ROOT_DIR; the other two default to the known HPC locations) ----
-ROOT_DIR="${ROOT_DIR:-/work/cniel/sw/singularity_containers/tuh-eeg-epilepsy/data/v3.0.0}"  # <-- EDIT: dir with 00_epilepsy/ 01_no_epilepsy/
+ROOT_DIR="${ROOT_DIR:-/work/cniel/sw/singularity_containers/tuh-eeg-epilepsy/project/data/v3.0.0}"  # <-- EDIT: dir with 00_epilepsy/ 01_no_epilepsy/
 export DATA_PATH="${DATA_PATH:-/work/cniel/sw/singularity_containers/tuh-eeg-epilepsy/BioFoundation}"
 export CHECKPOINT_DIR="${CHECKPOINT_DIR:-/work/cniel/sw/singularity_containers/tuh-eeg-epilepsy/checkpoints}"
 
