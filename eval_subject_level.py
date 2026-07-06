@@ -59,11 +59,11 @@ def _channelwise_normalize(x, eps=1e-8):
     return (x - mean) / (std + eps)
 
 
-def _metrics(y_true, prob):
-    """Threshold-free (AUROC/AP) plus 0.5-threshold label metrics."""
+def _metrics(y_true, prob, thr=0.5):
+    """Threshold-free (AUROC/AP) plus label metrics at decision threshold ``thr``."""
     y_true = np.asarray(y_true).astype(int)
     prob = np.asarray(prob, dtype=float)
-    pred = (prob >= 0.5).astype(int)
+    pred = (prob >= thr).astype(int)
     both = len(np.unique(y_true)) > 1
     return {
         "auroc": roc_auc_score(y_true, prob) if both else float("nan"),
@@ -79,6 +79,71 @@ def _metrics(y_true, prob):
 
 def _decode(s):
     return s.decode() if isinstance(s, (bytes, bytearray)) else str(s)
+
+
+def _best_threshold(y_true, prob):
+    """Decision threshold maximizing balanced accuracy (for calibration on a held-out split)."""
+    y_true = np.asarray(y_true).astype(int)
+    prob = np.asarray(prob, dtype=float)
+    edges = np.unique(np.concatenate([[0.0], prob, [1.0]]))
+    mids = (edges[:-1] + edges[1:]) / 2.0  # distinct decision points between sorted scores
+    best_thr, best_bal = 0.5, -1.0
+    for t in mids:
+        bal = balanced_accuracy_score(y_true, (prob >= t).astype(int))
+        if bal > best_bal:
+            best_bal, best_thr = bal, float(t)
+    return best_thr, best_bal
+
+
+def _infer_split(model, ch_loc, hdf5_file, batch, device):
+    """Run the model over an HDF5 split -> (prob_epilepsy, y, subject) per-window arrays."""
+    probs, ys, subjects = [], [], []
+    with h5py.File(hdf5_file, "r") as d:
+        keys = list(d.keys())
+        if keys and "subject" not in d[keys[0]]:
+            raise SystemExit(
+                f"{hdf5_file} has no per-window 'subject' dataset. Regenerate the split with the "
+                "updated process_tuep_eeg.py + make_hdf5.py so subject ids are stored."
+            )
+        # The channel cross-attention runs a TransformerEncoder over (B*num_patches, C, E); its
+        # fused CUDA kernel caps the grid at 65535, so shrink the batch for long windows.
+        if keys:
+            num_patches = max(1, int(d[keys[0]]["X"].shape[-1]) // 40)
+            safe = max(1, min(batch, 60000 // num_patches))
+            if safe < batch:
+                print(f"     reducing eval batch {batch} -> {safe} ({num_patches} patches/window, CUDA grid cap)")
+            batch = safe
+        for k in keys:
+            grp = d[k]
+            X_all, y_all, subj_all = grp["X"], grp["y"][:], grp["subject"][:]
+            n = X_all.shape[0]
+            for i in range(0, n, batch):
+                xb = _channelwise_normalize(torch.from_numpy(X_all[i:i + batch]).float().to(device))
+                mask = torch.zeros(xb.shape[0], xb.shape[1], xb.shape[2], dtype=torch.bool, device=device)
+                loc = ch_loc.unsqueeze(0).expand(xb.shape[0], -1, -1)
+                with torch.no_grad():
+                    logits, _ = model(xb, mask, loc)
+                    p = torch.softmax(logits.float(), dim=1)[:, 1]  # P(epilepsy), class index 1
+                probs.append(p.cpu().numpy())
+                ys.append(np.asarray(y_all[i:i + batch]))
+                subjects.append(subj_all[i:i + batch])
+    prob = np.concatenate(probs)
+    y = np.concatenate(ys).astype(int)
+    subj = np.array([_decode(s) for s in np.concatenate(subjects)])
+    return prob, y, subj
+
+
+def _subject_agg(prob, y, subj):
+    """Mean epilepsy probability per subject -> (subject_ids, s_prob, s_true, windows_per_subject)."""
+    by_prob, by_lab = defaultdict(list), {}
+    for p, yy, s in zip(prob, y, subj):
+        by_prob[s].append(p)
+        by_lab[s] = yy
+    ids = sorted(by_prob)
+    s_prob = np.array([np.mean(by_prob[s]) for s in ids])
+    s_true = np.array([by_lab[s] for s in ids])
+    win_per_subj = np.array([len(by_prob[s]) for s in ids])
+    return ids, s_prob, s_true, win_per_subj
 
 
 @hydra.main(config_path="./config", config_name="defaults", version_base="1.1")
@@ -113,44 +178,7 @@ def run(cfg: DictConfig):
         np.stack(get_channel_locations(CHN_ORDER[:num_channels]), axis=0), dtype=torch.float32, device=device
     )
 
-    probs, ys, subjects = [], [], []
-    with h5py.File(hdf5_file, "r") as d:
-        keys = list(d.keys())
-        if keys and "subject" not in d[keys[0]]:
-            raise SystemExit(
-                f"{hdf5_file} has no per-window 'subject' dataset. Regenerate the split with the "
-                "updated process_tuep_eeg.py + make_hdf5.py so subject ids are stored."
-            )
-        # The channel cross-attention runs a TransformerEncoder over (B*num_patches, C, E); its
-        # fused CUDA kernel caps the grid at 65535, so B*num_patches must stay under that or the
-        # forward dies with "CUDA error: invalid configuration argument". Shrink the batch for
-        # long windows (num_patches = T // patch_size, patch_size=40) so eval works at any length.
-        if keys:
-            t_samples = int(d[keys[0]]["X"].shape[-1])
-            num_patches = max(1, t_samples // 40)
-            safe = max(1, min(batch, 60000 // num_patches))
-            if safe < batch:
-                print(f"     reducing eval batch {batch} -> {safe} ({num_patches} patches/window, CUDA grid cap)")
-            batch = safe
-        for k in keys:
-            grp = d[k]
-            X_all, y_all, subj_all = grp["X"], grp["y"][:], grp["subject"][:]
-            n = X_all.shape[0]
-            for i in range(0, n, batch):
-                xb = torch.from_numpy(X_all[i:i + batch]).float().to(device)
-                xb = _channelwise_normalize(xb)
-                mask = torch.zeros(xb.shape[0], xb.shape[1], xb.shape[2], dtype=torch.bool, device=device)
-                loc = ch_loc.unsqueeze(0).expand(xb.shape[0], -1, -1)
-                with torch.no_grad():
-                    logits, _ = model(xb, mask, loc)
-                    p = torch.softmax(logits.float(), dim=1)[:, 1]  # P(epilepsy), class index 1
-                probs.append(p.cpu().numpy())
-                ys.append(np.asarray(y_all[i:i + batch]))
-                subjects.append(subj_all[i:i + batch])
-
-    prob = np.concatenate(probs)
-    y = np.concatenate(ys).astype(int)
-    subj = np.array([_decode(s) for s in np.concatenate(subjects)])
+    prob, y, subj = _infer_split(model, ch_loc, hdf5_file, batch, device)
 
     win_m = _metrics(y, prob)
     print(f"\n=== {split.upper()} WINDOW-LEVEL (n={len(y)} windows) ===")
@@ -161,15 +189,8 @@ def run(cfg: DictConfig):
         split, len(y), " ".join(f"{k}={v:.4f}" for k, v in win_m.items())))
 
     # Subject-level: mean epilepsy probability per subject; label is constant within subject.
-    by_prob, by_lab = defaultdict(list), {}
-    for p, yy, s in zip(prob, y, subj):
-        by_prob[s].append(p)
-        by_lab[s] = yy
-    subj_ids = sorted(by_prob)
-    s_prob = np.array([np.mean(by_prob[s]) for s in subj_ids])
-    s_true = np.array([by_lab[s] for s in subj_ids])
+    subj_ids, s_prob, s_true, win_per_subj = _subject_agg(prob, y, subj)
     n_pos = int(s_true.sum())
-    win_per_subj = np.array([len(by_prob[s]) for s in subj_ids])
     subj_m = _metrics(s_true, s_prob)
     print(f"\n=== {split.upper()} SUBJECT-LEVEL (n={len(subj_ids)} subjects: "
           f"{n_pos} epilepsy / {len(subj_ids) - n_pos} no-epilepsy; "
@@ -178,6 +199,23 @@ def run(cfg: DictConfig):
         print(f"  {kk:14s} {vv:.4f}")
     print("RESULT split={} level=subject n={} {}".format(
         split, len(subj_ids), " ".join(f"{k}={v:.4f}" for k, v in subj_m.items())))
+
+    # Subject-level threshold calibration: pick the decision threshold on the held-out calib
+    # split (max balanced accuracy), then re-score this split's subjects at that threshold. AUROC
+    # is threshold-free (unchanged); balanced_acc / sensitivity / specificity move to a fair point.
+    calib_split = cfg.get("calib_split", None) or os.getenv("CALIB_SPLIT")
+    if calib_split and calib_split != split:
+        c_hdf5 = cfg.data_module[calib_split].hdf5_file
+        c_prob, c_y, c_subj = _infer_split(model, ch_loc, c_hdf5, batch, device)
+        _, cs_prob, cs_true, _ = _subject_agg(c_prob, c_y, c_subj)
+        thr, cal_bal = _best_threshold(cs_true, cs_prob)
+        subj_cal = _metrics(s_true, s_prob, thr=thr)
+        print(f"\n=== {split.upper()} SUBJECT-LEVEL, threshold calibrated on '{calib_split}' "
+              f"(thr={thr:.4f}, {calib_split} bal_acc={cal_bal:.4f}) ===")
+        for kk, vv in subj_cal.items():
+            print(f"  {kk:14s} {vv:.4f}")
+        print("RESULT split={} level=subject_cal n={} threshold={:.4f} {}".format(
+            split, len(subj_ids), thr, " ".join(f"{k}={v:.4f}" for k, v in subj_cal.items())))
 
 
 if __name__ == "__main__":

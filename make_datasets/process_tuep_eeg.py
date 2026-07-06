@@ -94,9 +94,13 @@ def make_bipolar_20(raw):
 
 
 def process_and_dump_file(params):
-    """Worker: preprocess one EDF and dump its fixed-length windows as pickles."""
+    """Worker: preprocess one EDF, dump its fixed-length windows as pickles, and return a
+    manifest of the windows kept (one dict per window) so the exact same time-segments can be
+    reused by another model (e.g. HYDRA reads path/start/end and crops the native EDF)."""
     file_path, dump_folder, label, subject, max_windows, min_duration_s, window_samples = params
     stem = os.path.basename(file_path).split(".")[0]
+    split = os.path.basename(dump_folder)
+    window_s = window_samples / float(SFREQ)
     try:
         raw = mne.io.read_raw_edf(file_path, preload=True, verbose=False)
         # Keep the referential channels the bipolar montage needs, matched by electrode name
@@ -114,7 +118,7 @@ def process_and_dump_file(params):
         # 0.1 Hz high-pass needs a ~68 s FIR filter, so shorter signals get edge distortion
         # (RuntimeWarning "filter_length ... longer than the signal").
         if min_duration_s and raw.n_times / float(raw.info["sfreq"]) < min_duration_s:
-            return
+            return []
 
         raw.filter(l_freq=0.1, h_freq=75.0, verbose=False)
         raw.notch_filter(60, verbose=False)
@@ -128,13 +132,22 @@ def process_and_dump_file(params):
         n_win = n_times // window_samples
         if max_windows is not None:
             n_win = min(n_win, max_windows)
+        rows = []
         for i in range(n_win):
             seg = data[:, i * window_samples:(i + 1) * window_samples]
             with open(os.path.join(dump_folder, f"{stem}_{i}.pkl"), "wb") as f:
                 pickle.dump({"X": seg, "y": int(label), "subject": subject}, f)
+            # Window i spans [i*window_s, (i+1)*window_s] seconds of the recording. Resampling
+            # preserves the time axis, so these bounds are valid on the native EDF too.
+            rows.append({"subject": subject, "path": file_path, "split": split,
+                         "label": int(label), "window_idx": i,
+                         "start": round(i * window_s, 6), "end": round((i + 1) * window_s, 6),
+                         "window_s": window_s, "sfreq": SFREQ})
+        return rows
     except Exception as e:  # noqa: BLE001
         with open("tuep-process-errors.txt", "a") as f:
             f.write(f"Error processing {file_path}: {e}\n")
+        return []
 
 
 def _has_seizure(edf_path: Path) -> bool:
@@ -276,6 +289,10 @@ def main():
                         "divisible by the patch size (5 s=32 patches, 30 s=192, 60 s=384). Set --min_duration_s "
                         ">= this. Longer windows need a smaller finetune batch_size (more patches = more memory).")
     parser.add_argument("--keep_pkl", action="store_true", help="Keep the intermediate .pkl files after building the .h5 files.")
+    parser.add_argument("--manifest_dir", default=None,
+                        help="Where to write windows_{train,val,test}.csv (the kept window time-segments for a "
+                        "same-windows HYDRA comparison). Default: alongside the .h5 files. The sweep persists one "
+                        "set per (window_s, seed).")
     args = parser.parse_args()
     window_samples = int(round(args.window_s * SFREQ))
     if args.min_duration_s and args.min_duration_s < args.window_s:
@@ -324,8 +341,25 @@ def main():
         for edf, subject, label in recs
     ]
     print(f"Processing {len(params)} recordings with {args.processes} processes...")
+    manifest_rows = []
     with Pool(processes=args.processes) as pool:
-        list(tqdm.tqdm(pool.imap_unordered(process_and_dump_file, params), total=len(params)))
+        for rows in tqdm.tqdm(pool.imap_unordered(process_and_dump_file, params), total=len(params)):
+            if rows:
+                manifest_rows.extend(rows)
+
+    # Per-split window manifests: the exact (path, start, end) time-segments kept, so another
+    # model (HYDRA) can crop the identical windows from the native EDFs for a same-windows
+    # comparison. Written next to the HDF5s; --manifest_dir relocates them (the sweep persists
+    # one set per (window_s, seed)).
+    manifest_dir = args.manifest_dir or base
+    os.makedirs(manifest_dir, exist_ok=True)
+    manifest_cols = ["subject", "path", "split", "label", "window_idx", "start", "end", "window_s", "sfreq"]
+    for split in ("train", "val", "test"):
+        split_rows = [r for r in manifest_rows if r["split"] == split]
+        out_csv = os.path.join(manifest_dir, f"windows_{split}.csv")
+        pd.DataFrame(split_rows, columns=manifest_cols).to_csv(out_csv, index=False)
+    print(f"Wrote window manifests to {manifest_dir}/windows_{{train,val,test}}.csv "
+          f"({len(manifest_rows)} windows total).")
 
     for split in ("train", "val", "test"):
         src = os.path.join(proc, split)

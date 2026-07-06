@@ -40,7 +40,7 @@ VARIANTS = ["reconstruction_only", "lejepa_only_128", "mixed_128", "mixed_300"]
 MODES = {"frozen": "True", "full": "False"}  # mode name -> finetuning.freeze_layers value
 METRIC_KEYS = ["auroc", "avg_precision", "balanced_acc", "accuracy",
                "sensitivity", "specificity", "f1", "cohen_kappa"]
-CSV_FIELDS = ["seed", "variant", "mode", "split", "level", "n", "window_s", *METRIC_KEYS]
+CSV_FIELDS = ["window_s", "seed", "variant", "mode", "split", "level", "n", "threshold", *METRIC_KEYS]
 RESULT_RE = re.compile(r"^RESULT split=(\S+) level=(\S+) n=(\d+) (.+)$")
 
 
@@ -83,16 +83,22 @@ def find_best_ckpt(checkpoint_dir, tag):
 
 
 def summarize(rows):
+    # Report subject-level AUROC (threshold-free) and balanced accuracy at the val-calibrated
+    # threshold (level=subject_cal); fall back to the 0.5 threshold (level=subject) if calibration
+    # was disabled. Grouped by (window_s, variant, mode, split).
     agg = defaultdict(lambda: defaultdict(list))
     for r in rows:
-        if r["level"] != "subject":
+        if r["level"] not in ("subject", "subject_cal"):
             continue
-        key = (r["variant"], r["mode"], r["split"])
-        for k in ("auroc", "balanced_acc"):
-            try:
-                agg[key][k].append(float(r[k]))
-            except (ValueError, TypeError, KeyError):
-                pass
+        key = (r["window_s"], r["variant"], r["mode"], r["split"])
+        try:
+            if r["level"] == "subject":
+                agg[key]["auroc"].append(float(r["auroc"]))
+                agg[key].setdefault("balanced_acc", [])  # ensure the key exists
+            if r["level"] == "subject_cal":
+                agg[key]["balanced_acc_cal"].append(float(r["balanced_acc"]))
+        except (ValueError, TypeError, KeyError):
+            pass
 
     def ms(xs):
         if not xs:
@@ -100,13 +106,14 @@ def summarize(rows):
         sd = statistics.stdev(xs) if len(xs) > 1 else 0.0
         return f"{statistics.mean(xs):.3f}+/-{sd:.3f}"
 
-    print("\n================ SUBJECT-LEVEL SUMMARY (mean +/- std over seeds) ================")
-    print(f"{'variant':20s} {'mode':6s} {'split':5s} {'seeds':5s} {'AUROC':16s} {'bal_acc':16s}")
-    for variant, mode, split in sorted(agg):
-        a = agg[(variant, mode, split)]["auroc"]
-        b = agg[(variant, mode, split)]["balanced_acc"]
-        print(f"{variant:20s} {mode:6s} {split:5s} {len(a):<5d} {ms(a):16s} {ms(b):16s}")
-    print("Compare against HYDRA's ~0.63 subject-level balanced accuracy on this task.")
+    print("\n===== SUBJECT-LEVEL SUMMARY (mean +/- std over seeds; bal_acc at val-calibrated thr) =====")
+    print(f"{'win_s':6s} {'variant':20s} {'mode':6s} {'split':5s} {'seeds':5s} {'AUROC':16s} {'bal_acc_cal':16s}")
+    for key in sorted(agg):
+        window_s, variant, mode, split = key
+        a = agg[key]["auroc"]
+        b = agg[key].get("balanced_acc_cal", [])
+        print(f"{str(window_s):6s} {variant:20s} {mode:6s} {split:5s} {len(a):<5d} {ms(a):16s} {ms(b):16s}")
+    print("Compare against HYDRA (same windows, same calibration) subject-level balanced accuracy.")
 
 
 def main():
@@ -125,6 +132,12 @@ def main():
     p.add_argument("--monitor", default="val_BinaryAUROC", help="Checkpoint/early-stop monitor metric.")
     p.add_argument("--monitor_mode", default="max")
     p.add_argument("--splits", nargs="+", default=["test", "val"])
+    p.add_argument("--calib_split", default="val",
+                   help="Held-out split for subject-level threshold calibration (applied when scoring test); "
+                   "'' disables. The eval reports subject_cal metrics at the calibrated threshold.")
+    p.add_argument("--manifest_root", default=None,
+                   help="Persist each build's window manifests to <manifest_root>/w<window_s>_s<seed>/ so HYDRA "
+                   "can reuse the exact same windows (default: <output_dir>/manifests).")
     p.add_argument("--results_csv", default="sweep_results.csv")
     p.add_argument("--output_dir", default=os.getenv("DATA_PATH"),
                    help="Where TUEP_data/ is written (default $DATA_PATH).")
@@ -139,6 +152,9 @@ def main():
     env["DATA_PATH"] = args.output_dir
     env["CHECKPOINT_DIR"] = args.checkpoint_dir
     py = sys.executable
+    ws = float(args.window_s)
+    ws_tag = f"{args.window_s:g}"  # clean tag/dir label, e.g. 30 not 30.0
+    manifest_root = args.manifest_root or os.path.join(args.output_dir, "manifests")
 
     # Resume: load any prior results and skip completed (seed, variant, mode, split, level) cells.
     rows, done = [], set()
@@ -147,7 +163,7 @@ def main():
         with open(csv_path, newline="") as f:
             for r in csv.DictReader(f):
                 rows.append(r)
-                done.add((int(r["seed"]), r["variant"], r["mode"], r["split"], r["level"]))
+                done.add((float(r["window_s"]), int(r["seed"]), r["variant"], r["mode"], r["split"], r["level"]))
         print(f"Resuming from {csv_path}: {len(done)} result cells already present.")
 
     def write_csv():
@@ -157,32 +173,33 @@ def main():
             w.writerows(rows)
 
     for seed in args.seeds:
+        manifest_dir = os.path.join(manifest_root, f"w{ws_tag}_s{seed}")
         need_regen = any(
-            (seed, v, m, sp, "subject") not in done
+            (ws, seed, v, m, sp, "subject") not in done
             for v in args.variants for m in args.modes for sp in args.splits
         )
-        print(f"\n########## SEED {seed} ({args.window_s:g}s windows) ##########", flush=True)
+        print(f"\n########## {ws_tag}s windows | SEED {seed} ##########", flush=True)
         if need_regen:
             regen = [py, "make_datasets/process_tuep_eeg.py",
                      "--root_dir", args.root_dir, "--output_dir", args.output_dir, "--interictal",
                      "--seed", str(seed), "--window_s", str(args.window_s),
                      "--min_duration_s", str(args.min_duration_s),
                      "--max_windows_per_subject", str(args.max_windows_per_subject),
-                     "--processes", str(args.processes)]
+                     "--manifest_dir", manifest_dir, "--processes", str(args.processes)]
             if args.dry_run:
                 print("  $ " + " ".join(regen))
             else:
                 sh(regen, env=env)
         else:
-            print("  all cells done for this seed; skipping regeneration.")
+            print("  all cells done for this build; skipping regeneration.")
 
         for variant in args.variants:
             for mode in args.modes:
-                pending = [sp for sp in args.splits if (seed, variant, mode, sp, "subject") not in done]
+                pending = [sp for sp in args.splits if (ws, seed, variant, mode, sp, "subject") not in done]
                 if not pending:
-                    print(f"  [skip] seed={seed} {variant}/{mode} already done", flush=True)
+                    print(f"  [skip] w{ws_tag} seed={seed} {variant}/{mode} already done", flush=True)
                     continue
-                tag = f"sweep_s{seed}_{variant}_{mode}"
+                tag = f"sweep_w{ws_tag}_s{seed}_{variant}_{mode}"
                 print(f"\n---- seed={seed} variant={variant} mode={mode} (tag={tag}) ----", flush=True)
                 ft = [py, "-u", "run_train.py", "+experiment=LuMamba_finetune",
                       f"pretrained_variant={variant}", f"finetuning.freeze_layers={MODES[mode]}",
@@ -201,8 +218,9 @@ def main():
                 if args.dry_run:
                     print("  $ " + " ".join(ft))
                     for sp in pending:
+                        cal = f" +calib_split={args.calib_split}" if args.calib_split and args.calib_split != sp else ""
                         print(f"  $ EVAL_CHECKPOINT=<best> {py} -u eval_subject_level.py "
-                              f"+experiment=LuMamba_finetune +eval_split={sp} +eval_batch_size={args.batch_size}")
+                              f"+experiment=LuMamba_finetune +eval_split={sp} +eval_batch_size={args.batch_size}{cal}")
                     continue
 
                 try:
@@ -219,6 +237,9 @@ def main():
                 for sp in pending:
                     ev = [py, "-u", "eval_subject_level.py", "+experiment=LuMamba_finetune",
                           f"+eval_split={sp}", f"+eval_batch_size={args.batch_size}"]
+                    # Calibrate the subject threshold on --calib_split when scoring a different split.
+                    if args.calib_split and args.calib_split != sp:
+                        ev.append(f"+calib_split={args.calib_split}")
                     try:
                         out = sh(ev, env=dict(env, EVAL_CHECKPOINT=ckpt), capture=True)
                     except RuntimeError as e:
@@ -226,11 +247,11 @@ def main():
                         continue
                     print(out)
                     for (rsplit, level), m in parse_results(out).items():
-                        rows.append({"seed": seed, "variant": variant, "mode": mode,
+                        rows.append({"window_s": ws, "seed": seed, "variant": variant, "mode": mode,
                                      "split": rsplit, "level": level, "n": m["n"],
-                                     "window_s": args.window_s,
+                                     "threshold": m.get("threshold", ""),
                                      **{k: m.get(k, "") for k in METRIC_KEYS}})
-                        done.add((seed, variant, mode, rsplit, level))
+                        done.add((ws, seed, variant, mode, rsplit, level))
                     write_csv()
 
     if not args.dry_run:
