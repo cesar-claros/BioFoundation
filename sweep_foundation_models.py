@@ -90,12 +90,13 @@ def summarize(rows):
     for r in rows:
         if r["level"] not in ("subject", "subject_cal"):
             continue
-        key = (r["window_s"], r["variant"], r["mode"], r["split"])
         try:
+            # window_s is a float for rows added this run but a str when reloaded from the CSV
+            # (resume); normalize so the sort key is not a mix of float and str.
+            key = (float(r["window_s"]), r["variant"], r["mode"], r["split"])
             if r["level"] == "subject":
                 agg[key]["auroc"].append(float(r["auroc"]))
-                agg[key].setdefault("balanced_acc", [])  # ensure the key exists
-            if r["level"] == "subject_cal":
+            elif r["level"] == "subject_cal":
                 agg[key]["balanced_acc_cal"].append(float(r["balanced_acc"]))
         except (ValueError, TypeError, KeyError):
             pass
@@ -112,7 +113,7 @@ def summarize(rows):
         window_s, variant, mode, split = key
         a = agg[key]["auroc"]
         b = agg[key].get("balanced_acc_cal", [])
-        print(f"{str(window_s):6s} {variant:20s} {mode:6s} {split:5s} {len(a):<5d} {ms(a):16s} {ms(b):16s}")
+        print(f"{f'{window_s:g}':6s} {variant:20s} {mode:6s} {split:5s} {len(a):<5d} {ms(a):16s} {ms(b):16s}")
     print("Compare against HYDRA (same windows, same calibration) subject-level balanced accuracy.")
 
 
@@ -255,7 +256,10 @@ def main():
                     write_csv()
 
     if not args.dry_run:
-        summarize(rows)
+        try:
+            summarize(rows)
+        except Exception as e:  # noqa: BLE001 - never let a summary bug lose a completed sweep
+            print(f"!! summary failed ({e}); results are safe in {csv_path}.", flush=True)
         print(f"\nWrote {csv_path} ({len(rows)} rows).")
 
 
