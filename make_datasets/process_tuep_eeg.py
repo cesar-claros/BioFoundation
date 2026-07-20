@@ -93,41 +93,49 @@ def make_bipolar_20(raw):
     return np.asarray(out, dtype=np.float32)
 
 
+def _preprocess_bipolar(file_path, min_duration_s):
+    """Read one EDF and return its (20, T) TCP-bipolar array at SFREQ (band-pass 0.1-75 Hz, notch
+    60 Hz, resample 256 Hz), or None if the recording is shorter than ``min_duration_s``. Raises
+    ValueError if the 20 bipolar pairs cannot be built. Shared by the normal build and the
+    from-manifest rebuild so both crop byte-identical windows."""
+    raw = mne.io.read_raw_edf(file_path, preload=True, verbose=False)
+    # Keep the referential channels the bipolar montage needs, matched by electrode name (so the
+    # exact TUH label format / EEG prefix does not matter). '_a' montages just lack the ear
+    # channels, which we do not use.
+    needed = {e for _n, a, b in BIPOLAR_PAIRS for e in (a, b)}
+    present = [c for c in raw.ch_names if _electrode(c) in needed]
+    found = {_electrode(c) for c in present}
+    if len(found) < len(needed):
+        raise ValueError(f"missing referential channels ({len(found)}/{len(needed)}); "
+                         f"channels seen: {raw.ch_names[:25]}")
+    raw.pick(present)
+    # Drop recordings shorter than min_duration_s (native rate, before filtering): the 0.1 Hz
+    # high-pass needs a ~68 s FIR filter, so shorter signals get edge distortion (RuntimeWarning
+    # "filter_length ... longer than the signal").
+    if min_duration_s and raw.n_times / float(raw.info["sfreq"]) < min_duration_s:
+        return None
+    raw.filter(l_freq=0.1, h_freq=75.0, verbose=False)
+    raw.notch_filter(60, verbose=False)
+    if int(round(raw.info["sfreq"])) != SFREQ:
+        raw.resample(SFREQ, npad="auto", n_jobs=1, verbose=False)
+    data = make_bipolar_20(raw)
+    if data is None or data.shape[0] != N_BIPOLAR:
+        raise ValueError("could not build the 20 bipolar channels")
+    return data
+
+
 def process_and_dump_file(params):
-    """Worker: preprocess one EDF, dump its fixed-length windows as pickles, and return a
-    manifest of the windows kept (one dict per window) so the exact same time-segments can be
-    reused by another model (e.g. HYDRA reads path/start/end and crops the native EDF)."""
+    """Worker: preprocess one EDF, dump its first ``max_windows`` fixed-length windows as pickles,
+    and return a manifest of the windows kept (one dict per window) so the exact same time-segments
+    can be reused by another model (e.g. HYDRA reads path/start/end and crops the native EDF)."""
     file_path, dump_folder, label, subject, max_windows, min_duration_s, window_samples = params
     stem = os.path.basename(file_path).split(".")[0]
     split = os.path.basename(dump_folder)
     window_s = window_samples / float(SFREQ)
     try:
-        raw = mne.io.read_raw_edf(file_path, preload=True, verbose=False)
-        # Keep the referential channels the bipolar montage needs, matched by electrode name
-        # (so the exact TUH label format / EEG prefix does not matter). '_a' montages just
-        # lack the ear channels, which we do not use.
-        needed = {e for _n, a, b in BIPOLAR_PAIRS for e in (a, b)}
-        present = [c for c in raw.ch_names if _electrode(c) in needed]
-        found = {_electrode(c) for c in present}
-        if len(found) < len(needed):
-            raise ValueError(f"missing referential channels ({len(found)}/{len(needed)}); "
-                             f"channels seen: {raw.ch_names[:25]}")
-        raw.pick(present)
-
-        # Drop recordings shorter than min_duration_s (native rate, before filtering): the
-        # 0.1 Hz high-pass needs a ~68 s FIR filter, so shorter signals get edge distortion
-        # (RuntimeWarning "filter_length ... longer than the signal").
-        if min_duration_s and raw.n_times / float(raw.info["sfreq"]) < min_duration_s:
+        data = _preprocess_bipolar(file_path, min_duration_s)
+        if data is None:
             return []
-
-        raw.filter(l_freq=0.1, h_freq=75.0, verbose=False)
-        raw.notch_filter(60, verbose=False)
-        if int(round(raw.info["sfreq"])) != SFREQ:
-            raw.resample(SFREQ, npad="auto", n_jobs=1, verbose=False)
-
-        data = make_bipolar_20(raw)
-        if data is None or data.shape[0] != N_BIPOLAR:
-            raise ValueError("could not build the 20 bipolar channels")
         n_times = data.shape[1]
         n_win = n_times // window_samples
         if max_windows is not None:
@@ -148,6 +156,40 @@ def process_and_dump_file(params):
         with open("tuep-process-errors.txt", "a") as f:
             f.write(f"Error processing {file_path}: {e}\n")
         return []
+
+
+def dump_windows_from_manifest(params):
+    """Worker for the from-manifest rebuild: crop EXACTLY the manifest-listed windows of one
+    recording (by window_idx) and dump them as pickles, reusing the same preprocessing. No split /
+    cap derivation and no manifest is written, so the persisted manifest stays the single source of
+    truth. params: (file_path, dump_folder, label, subject, keep_indices, window_samples). Returns
+    the number of windows dumped."""
+    file_path, dump_folder, label, subject, keep_indices, window_samples = params
+    stem = os.path.basename(file_path).split(".")[0]
+    try:
+        # The min_duration drop already happened at build time (short recordings are absent from
+        # the manifest), so do not re-apply it here.
+        data = _preprocess_bipolar(file_path, 0.0)
+        if data is None:
+            return 0
+        n_times = data.shape[1]
+        dumped = 0
+        for i in sorted({int(k) for k in keep_indices}):
+            a, b = i * window_samples, (i + 1) * window_samples
+            if b > n_times:
+                with open("tuep-process-errors.txt", "a") as f:
+                    f.write(f"manifest window {i} out of range for {file_path} "
+                            f"(need {b} <= {n_times}); preprocessing drifted, skipping\n")
+                continue
+            seg = data[:, a:b]
+            with open(os.path.join(dump_folder, f"{stem}_{i}.pkl"), "wb") as f:
+                pickle.dump({"X": seg, "y": int(label), "subject": subject}, f)
+            dumped += 1
+        return dumped
+    except Exception as e:  # noqa: BLE001
+        with open("tuep-process-errors.txt", "a") as f:
+            f.write(f"Error rebuilding {file_path} from manifest: {e}\n")
+        return 0
 
 
 def _has_seizure(edf_path: Path) -> bool:
@@ -289,6 +331,16 @@ def main():
                         "divisible by the patch size (5 s=32 patches, 30 s=192, 60 s=384). Set --min_duration_s "
                         ">= this. Longer windows need a smaller finetune batch_size (more patches = more memory).")
     parser.add_argument("--keep_pkl", action="store_true", help="Keep the intermediate .pkl files after building the .h5 files.")
+    parser.add_argument("--from_manifest", default=None,
+                        help="Rebuild the HDF5 by cropping EXACTLY the windows recorded in a persisted manifest "
+                        "directory (its windows_{train,val,test}.csv), instead of re-deriving the subject split "
+                        "and re-windowing. Reads the manifest (does NOT rewrite it) so it stays the source of "
+                        "truth, and guarantees the same windows the original build produced. Ignores --seed / "
+                        "--interictal / --max_windows_per_subject (those are baked into the manifest). Used by the "
+                        "inference-only score dump (sweep_foundation_models.py --dump_only).")
+    parser.add_argument("--manifest_splits", nargs="+", default=["train", "val", "test"],
+                        help="With --from_manifest, only rebuild these splits' HDF5 (e.g. 'test val' to skip the "
+                        "large train build when only dumping test/val scores). Default: all three.")
     parser.add_argument("--manifest_dir", default=None,
                         help="Where to write windows_{train,val,test}.csv (the kept window time-segments for a "
                         "same-windows HYDRA comparison). Default: alongside the .h5 files. The sweep persists one "
@@ -307,6 +359,45 @@ def main():
     shutil.rmtree(proc, ignore_errors=True)
     for split in ("train", "val", "test"):
         os.makedirs(os.path.join(proc, split), exist_ok=True)
+
+    # From-manifest rebuild (used by the inference-only score dump): reconstruct the HDF5 by
+    # cropping EXACTLY the windows a persisted manifest records, WITHOUT re-deriving the split /
+    # caps and WITHOUT rewriting the manifest. This keeps the manifest the single source of truth
+    # (the same-windows HYDRA comparison relies on it) and guarantees the rebuilt windows match the
+    # ones the checkpoint was trained / evaluated on, robust to any later drift in the split logic.
+    if args.from_manifest:
+        man_dir = Path(args.from_manifest)
+        want = set(args.manifest_splits)
+        frames = []
+        for split in ("train", "val", "test"):
+            csv_path = man_dir / f"windows_{split}.csv"
+            if split in want and csv_path.exists():
+                frames.append(pd.read_csv(csv_path))
+        if not frames:
+            raise SystemExit(f"No windows_{{{','.join(sorted(want))}}}.csv found in {man_dir}.")
+        man = pd.concat(frames, ignore_index=True)
+        man_ws = float(man["window_s"].iloc[0])
+        if not np.isclose(man_ws, args.window_s):
+            print(f"!! manifest window_s={man_ws} != --window_s={args.window_s}; using the manifest's.")
+        ws_samples = int(round(man_ws * SFREQ))
+        params = [
+            (str(path), os.path.join(proc, split), int(label), str(subject),
+             g["window_idx"].tolist(), ws_samples)
+            for (path, split, subject, label), g in man.groupby(["path", "split", "subject", "label"])
+        ]
+        print(f"Rebuilding {len(params)} recordings ({len(man)} windows, splits={sorted(want)}) from "
+              f"manifest {man_dir}; NOT rewriting it.")
+        with Pool(processes=args.processes) as pool:
+            counts = list(tqdm.tqdm(pool.imap_unordered(dump_windows_from_manifest, params),
+                                    total=len(params)))
+        print(f"Dumped {sum(counts)} windows across {len(params)} recordings.")
+        for split in ("train", "val", "test"):
+            if split in want:
+                create_hdf5(os.path.join(proc, split), os.path.join(base, f"{split}.h5"), finetune=True)
+        if not args.keep_pkl:
+            shutil.rmtree(proc, ignore_errors=True)
+        print(f"Done (from manifest). HDF5 at {base}/{{{','.join(sorted(want))}}}.h5")
+        return
 
     recs = collect_recordings(root_dir, args.interictal)
     if not recs:

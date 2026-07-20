@@ -151,8 +151,9 @@ def main():
                    "(scripts/plot_roc_variants.py).")
     p.add_argument("--dump_only", action="store_true",
                    help="Inference-only: SKIP finetuning, reload each cell's existing checkpoint, and just "
-                   "(re)dump its scores. Implies --dump_dir. Regenerates each build's HDF5 (deterministic), "
-                   "ignores the results CSV, and resumes by skipping cells whose dump npz already exists.")
+                   "(re)dump its scores. Implies --dump_dir. Rebuilds each build's HDF5 by cropping the "
+                   "persisted manifest's exact windows (reads it, does NOT rewrite it), ignores the results "
+                   "CSV, and resumes by skipping cells whose dump npz already exists.")
     args = p.parse_args()
 
     if args.dump_only and not args.dump_dir:
@@ -194,12 +195,24 @@ def main():
         )
         print(f"\n########## {ws_tag}s windows | SEED {seed} ##########", flush=True)
         if need_regen:
-            regen = [py, "make_datasets/process_tuep_eeg.py",
-                     "--root_dir", args.root_dir, "--output_dir", args.output_dir, "--interictal",
-                     "--seed", str(seed), "--window_s", str(args.window_s),
-                     "--min_duration_s", str(args.min_duration_s),
-                     "--max_windows_per_subject", str(args.max_windows_per_subject),
-                     "--manifest_dir", manifest_dir, "--processes", str(args.processes)]
+            if args.dump_only:
+                # Inference-only: rebuild the HDF5 by cropping EXACTLY the persisted manifest's
+                # windows (read-only), so scores match the windows the checkpoint saw and the
+                # manifest HYDRA reuses is never rewritten. Only build the splits we will dump.
+                if not args.dry_run and not os.path.isdir(manifest_dir):
+                    raise SystemExit(f"--dump_only needs the persisted manifest at {manifest_dir} "
+                                     "(from the original sweep); not found.")
+                regen = [py, "make_datasets/process_tuep_eeg.py",
+                         "--root_dir", args.root_dir, "--output_dir", args.output_dir,
+                         "--window_s", str(args.window_s), "--from_manifest", manifest_dir,
+                         "--manifest_splits", *args.splits, "--processes", str(args.processes)]
+            else:
+                regen = [py, "make_datasets/process_tuep_eeg.py",
+                         "--root_dir", args.root_dir, "--output_dir", args.output_dir, "--interictal",
+                         "--seed", str(seed), "--window_s", str(args.window_s),
+                         "--min_duration_s", str(args.min_duration_s),
+                         "--max_windows_per_subject", str(args.max_windows_per_subject),
+                         "--manifest_dir", manifest_dir, "--processes", str(args.processes)]
             if args.dry_run:
                 print("  $ " + " ".join(regen))
             else:

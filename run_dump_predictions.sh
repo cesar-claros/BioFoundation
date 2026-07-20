@@ -8,14 +8,17 @@
 #* the sweep's build + checkpoint-finding logic via --dump_only. Resumable: cells whose npz
 #* already exist are skipped.
 #*
-#* PREREQUISITE: the checkpoints from the sweep must still exist under
-#*   $CHECKPOINT_DIR/checkpoints/sweep_w<ws>_s<seed>_<variant>_full/ .
+#* PREREQUISITE: the sweep's checkpoints AND per-(ws,seed) manifests must still exist:
+#*   $CHECKPOINT_DIR/checkpoints/sweep_w<ws>_s<seed>_<variant>_full/   (checkpoints)
+#*   $MANIFEST_ROOT/w<ws>_s<seed>/windows_{test,val}.csv               (window record)
 #*
 #* EDIT ROOT_DIR, then from the repo root:
 #*   nohup bash run_dump_predictions.sh > dump_predictions.log 2>&1 &
 #* Then plot:  python scripts/plot_roc_variants.py --dump_dir <DUMP_DIR> --level subject
 #*
-#* WARNING: regenerating overwrites <DATA_PATH>/TUEP_data/*.h5 each build (scores persist in DUMP_DIR).
+#* The HDF5 is rebuilt by cropping the persisted manifest's EXACT windows (read-only), so the
+#* manifests HYDRA reuses are NOT rewritten. Rebuilding still overwrites <DATA_PATH>/TUEP_data/*.h5
+#* each build (scores persist in DUMP_DIR).
 #*----------------------------------------------------------------------------*
 set -euo pipefail
 
@@ -27,6 +30,7 @@ WINDOWS="${WINDOWS:-15 30 45 60}"
 SEEDS="${SEEDS:-0 1 2 3 4}"
 SPLITS="${SPLITS:-test val}"
 DUMP_DIR="${DUMP_DIR:-$DATA_PATH/roc_dumps}"
+MANIFEST_ROOT="${MANIFEST_ROOT:-$DATA_PATH/manifests}"  # must match the sweep's (run_lumamba_vs_hydra.sh)
 
 cd "$(dirname "$0")"
 [ -d "$ROOT_DIR" ] || { echo "ERROR: ROOT_DIR not found: $ROOT_DIR (edit run_dump_predictions.sh)"; exit 1; }
@@ -42,7 +46,7 @@ for WS in $WINDOWS; do
     python -u sweep_foundation_models.py --root_dir "$ROOT_DIR" \
         --window_s "$WS" --seeds $SEEDS \
         --variants reconstruction_only lejepa_only_128 mixed_128 mixed_300 --modes full \
-        --batch_size "$BW" --splits $SPLITS \
+        --batch_size "$BW" --splits $SPLITS --manifest_root "$MANIFEST_ROOT" \
         --dump_only --dump_dir "$DUMP_DIR"
 done
 
