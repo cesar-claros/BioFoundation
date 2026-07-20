@@ -29,6 +29,9 @@ export CHECKPOINT_DIR="${CHECKPOINT_DIR:-/work/cniel/sw/singularity_containers/t
 WINDOWS="${WINDOWS:-15 30 45 60}"
 SEEDS="${SEEDS:-0 1 2 3 4}"
 SPLITS="${SPLITS:-test val}"
+# Best models only (top-2 by subject/window AUROC). Override to add/replace, e.g.
+# VARIANTS="lejepa_only_128 mixed_300 mixed_128" or all four.
+VARIANTS="${VARIANTS:-lejepa_only_128 mixed_300}"
 DUMP_DIR="${DUMP_DIR:-$DATA_PATH/roc_dumps}"
 MANIFEST_ROOT="${MANIFEST_ROOT:-$DATA_PATH/manifests}"  # must match the sweep's (run_lumamba_vs_hydra.sh)
 
@@ -36,7 +39,7 @@ cd "$(dirname "$0")"
 [ -d "$ROOT_DIR" ] || { echo "ERROR: ROOT_DIR not found: $ROOT_DIR (edit run_dump_predictions.sh)"; exit 1; }
 
 echo "ROOT_DIR=$ROOT_DIR | DATA_PATH=$DATA_PATH | CHECKPOINT_DIR=$CHECKPOINT_DIR"
-echo "windows=[$WINDOWS] seeds=[$SEEDS] splits=[$SPLITS] -> dumps in $DUMP_DIR"
+echo "variants=[$VARIANTS] windows=[$WINDOWS] seeds=[$SEEDS] splits=[$SPLITS] -> dumps in $DUMP_DIR"
 
 for WS in $WINDOWS; do
     # Inference batch can be larger than training; still scale down for long windows to respect
@@ -45,10 +48,10 @@ for WS in $WINDOWS; do
     echo "==================== dump window_s=${WS}s  batch=${BW} ===================="
     python -u sweep_foundation_models.py --root_dir "$ROOT_DIR" \
         --window_s "$WS" --seeds $SEEDS \
-        --variants reconstruction_only lejepa_only_128 mixed_128 mixed_300 --modes full \
+        --variants $VARIANTS --modes full \
         --batch_size "$BW" --splits $SPLITS --manifest_root "$MANIFEST_ROOT" \
         --dump_only --dump_dir "$DUMP_DIR"
 done
 
 echo "Score dump done -> $DUMP_DIR"
-echo "Plot: python scripts/plot_roc_variants.py --dump_dir $DUMP_DIR --level subject --split test"
+echo "Plot: python scripts/plot_roc_variants.py --dump_dir $DUMP_DIR --level subject --split test --variants $VARIANTS"

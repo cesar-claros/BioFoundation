@@ -34,6 +34,8 @@ FNAME = re.compile(r"^w(?P<ws>[0-9.]+)_s(?P<seed>\d+)_(?P<variant>.+)_(?P<mode>f
 VARIANT_ORDER = ["reconstruction_only", "lejepa_only_128", "mixed_128", "mixed_300"]
 VARIANT_COLOR = {"reconstruction_only": "tab:gray", "lejepa_only_128": "tab:orange",
                  "mixed_128": "tab:green", "mixed_300": "tab:blue"}
+VARIANT_SHORT = {"reconstruction_only": "rec", "lejepa_only_128": "lejepa",
+                 "mixed_128": "m128", "mixed_300": "m300"}
 GRID = np.linspace(0.0, 1.0, 201)  # common FPR grid for vertical averaging
 
 
@@ -60,10 +62,10 @@ def _roc(npz_path: Path, level: str):
     return tpr_grid, float(roc_auc_score(y, s))
 
 
-def _panel(ax, recs_w, level, title):
+def _panel(ax, recs_w, level, title, variants):
     """Draw the per-variant mean ROC (+/-1 std band) for one window on ``ax``."""
     ax.plot([0, 1], [0, 1], color="0.7", lw=0.8, ls="--", zorder=1)  # chance
-    for variant in VARIANT_ORDER:
+    for variant in variants:
         curves, aucs = [], []
         for _ws, _seed, var, path in recs_w:
             if var != variant:
@@ -97,6 +99,9 @@ def main() -> None:
                    help="ROC on subject-aggregated scores (mean-prob per subject) or per window.")
     p.add_argument("--split", default="test", help="Which split's dumps to plot (default test).")
     p.add_argument("--mode", default="full", choices=["full", "frozen"], help="Finetune mode to plot.")
+    p.add_argument("--variants", nargs="+", default=None, choices=VARIANT_ORDER,
+                   help="Restrict to these variants (e.g. the best models: lejepa_only_128 mixed_300); "
+                   "default: every variant with dumps present.")
     p.add_argument("--window_s", type=float, default=None,
                    help="Restrict to one window length (Hz); default: one panel per window found.")
     p.add_argument("--out", default=None, help="Output PNG (default: <dump_dir>/roc_variants_<level>_<split>.png).")
@@ -106,6 +111,15 @@ def main() -> None:
     if not recs:
         raise SystemExit(f"No '*_{args.split}.npz' dumps ({args.mode} mode) in {args.dump_dir}; "
                          "run the sweep with --dump_only --dump_dir first.")
+    # Variants to draw, in canonical order, restricted to --variants and to those actually dumped.
+    present = {var for _ws, _seed, var, _p in recs}
+    plot_variants = [v for v in VARIANT_ORDER if (args.variants is None or v in args.variants)]
+    missing = [v for v in plot_variants if v not in present]
+    if missing:
+        print(f"note: no dumps for {missing} in {args.dump_dir}; skipping them.")
+    plot_variants = [v for v in plot_variants if v in present]
+    if not plot_variants:
+        raise SystemExit(f"None of the requested variants have dumps in {args.dump_dir}.")
     windows = sorted({ws for ws, *_ in recs})
     if args.window_s is not None:
         windows = [w for w in windows if np.isclose(w, args.window_s)]
@@ -118,7 +132,7 @@ def main() -> None:
     axes = axes.ravel()
     for i, ws in enumerate(windows):
         recs_w = [r for r in recs if np.isclose(r[0], ws)]
-        _panel(axes[i], recs_w, args.level, f"{ws:g}s windows")
+        _panel(axes[i], recs_w, args.level, f"{ws:g}s windows", plot_variants)
     for ax in axes[len(windows):]:
         ax.axis("off")
 
@@ -128,12 +142,14 @@ def main() -> None:
     fig.supylabel("true positive rate (sensitivity)")
     fig.tight_layout(rect=(0, 0, 1, 0.97))
 
+    vtag = "" if args.variants is None else "_" + "-".join(VARIANT_SHORT[v] for v in plot_variants)
     suffix = f"_w{args.window_s:g}" if args.window_s is not None else ""
-    out = Path(args.out) if args.out else Path(args.dump_dir) / f"roc_variants_{args.level}_{args.split}{suffix}.png"
+    out = (Path(args.out) if args.out else
+           Path(args.dump_dir) / f"roc_variants_{args.level}_{args.split}{vtag}{suffix}.png")
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out, dpi=140)
     plt.close(fig)
-    print(f"wrote {out}  ({len(windows)} window panel(s), variants={VARIANT_ORDER})")
+    print(f"wrote {out}  ({len(windows)} window panel(s), variants={plot_variants})")
 
 
 if __name__ == "__main__":
