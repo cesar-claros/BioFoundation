@@ -31,11 +31,13 @@ from sklearn.metrics import roc_auc_score, roc_curve  # noqa: E402
 
 # w<ws>_s<seed>_<variant>_<mode>_<split>.npz; variant may contain '_', so anchor mode/split.
 FNAME = re.compile(r"^w(?P<ws>[0-9.]+)_s(?P<seed>\d+)_(?P<variant>.+)_(?P<mode>full|frozen)_(?P<split>\w+)\.npz$")
-VARIANT_ORDER = ["reconstruction_only", "lejepa_only_128", "mixed_128", "mixed_300"]
+# The LuMamba pretraining variants plus 'hydra' (the same-windows HYDRA baseline, dumped by
+# code/src/utils/trainer.py in the same npz schema), so all overlay in one ROC panel.
+VARIANT_ORDER = ["reconstruction_only", "lejepa_only_128", "mixed_128", "mixed_300", "hydra"]
 VARIANT_COLOR = {"reconstruction_only": "tab:gray", "lejepa_only_128": "tab:orange",
-                 "mixed_128": "tab:green", "mixed_300": "tab:blue"}
+                 "mixed_128": "tab:green", "mixed_300": "tab:blue", "hydra": "tab:red"}
 VARIANT_SHORT = {"reconstruction_only": "rec", "lejepa_only_128": "lejepa",
-                 "mixed_128": "m128", "mixed_300": "m300"}
+                 "mixed_128": "m128", "mixed_300": "m300", "hydra": "hydra"}
 GRID = np.linspace(0.0, 1.0, 201)  # common FPR grid for vertical averaging
 
 
