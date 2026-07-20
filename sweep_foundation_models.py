@@ -145,7 +145,18 @@ def main():
     p.add_argument("--checkpoint_dir", default=os.getenv("CHECKPOINT_DIR"),
                    help="Run outputs root (default $CHECKPOINT_DIR).")
     p.add_argument("--dry_run", action="store_true", help="Print the commands without running them.")
+    p.add_argument("--dump_dir", default=None,
+                   help="Also dump each eval's per-window/per-subject scores (labels + probabilities) as "
+                   "<dump_dir>/w<ws>_s<seed>_<variant>_<mode>_<split>.npz, for offline ROC curves "
+                   "(scripts/plot_roc_variants.py).")
+    p.add_argument("--dump_only", action="store_true",
+                   help="Inference-only: SKIP finetuning, reload each cell's existing checkpoint, and just "
+                   "(re)dump its scores. Implies --dump_dir. Regenerates each build's HDF5 (deterministic), "
+                   "ignores the results CSV, and resumes by skipping cells whose dump npz already exists.")
     args = p.parse_args()
+
+    if args.dump_only and not args.dump_dir:
+        raise SystemExit("--dump_only needs --dump_dir (where to write the score npz files).")
 
     if not args.output_dir or not args.checkpoint_dir:
         raise SystemExit("Set DATA_PATH and CHECKPOINT_DIR (env) or pass --output_dir / --checkpoint_dir.")
@@ -175,7 +186,9 @@ def main():
 
     for seed in args.seeds:
         manifest_dir = os.path.join(manifest_root, f"w{ws_tag}_s{seed}")
-        need_regen = any(
+        # In dump-only mode we always need the HDF5 present to run inference (the build is
+        # deterministic from seed + window_s), regardless of what the results CSV already has.
+        need_regen = args.dump_only or any(
             (ws, seed, v, m, sp, "subject") not in done
             for v in args.variants for m in args.modes for sp in args.splits
         )
@@ -196,7 +209,13 @@ def main():
 
         for variant in args.variants:
             for mode in args.modes:
-                pending = [sp for sp in args.splits if (ws, seed, variant, mode, sp, "subject") not in done]
+                dump_tag = f"w{ws_tag}_s{seed}_{variant}_{mode}"
+                if args.dump_only:
+                    # Resume by skipping cells whose dump npz already exists for every split.
+                    pending = [sp for sp in args.splits
+                               if not Path(args.dump_dir, f"{dump_tag}_{sp}.npz").exists()]
+                else:
+                    pending = [sp for sp in args.splits if (ws, seed, variant, mode, sp, "subject") not in done]
                 if not pending:
                     print(f"  [skip] w{ws_tag} seed={seed} {variant}/{mode} already done", flush=True)
                     continue
@@ -217,18 +236,22 @@ def main():
                     ft.append(f"trainer.max_epochs={args.max_epochs}")
 
                 if args.dry_run:
-                    print("  $ " + " ".join(ft))
+                    if not args.dump_only:
+                        print("  $ " + " ".join(ft))
                     for sp in pending:
                         cal = f" +calib_split={args.calib_split}" if args.calib_split and args.calib_split != sp else ""
+                        dmp = f" +dump_dir={args.dump_dir} +dump_tag={dump_tag}" if args.dump_dir else ""
                         print(f"  $ EVAL_CHECKPOINT=<best> {py} -u eval_subject_level.py "
-                              f"+experiment=LuMamba_finetune +eval_split={sp} +eval_batch_size={args.batch_size}{cal}")
+                              f"+experiment=LuMamba_finetune +eval_split={sp} +eval_batch_size={args.batch_size}{cal}{dmp}")
                     continue
 
-                try:
-                    sh(ft, env=env)
-                except RuntimeError as e:
-                    print(f"  !! finetune failed, skipping: {e}", flush=True)
-                    continue
+                # Inference-only dump reuses the existing checkpoint; only train when not dumping.
+                if not args.dump_only:
+                    try:
+                        sh(ft, env=env)
+                    except RuntimeError as e:
+                        print(f"  !! finetune failed, skipping: {e}", flush=True)
+                        continue
                 ckpt = find_best_ckpt(args.checkpoint_dir, tag)
                 if ckpt is None:
                     print(f"  !! no checkpoint found for {tag}; skipping eval", flush=True)
@@ -241,12 +264,18 @@ def main():
                     # Calibrate the subject threshold on --calib_split when scoring a different split.
                     if args.calib_split and args.calib_split != sp:
                         ev.append(f"+calib_split={args.calib_split}")
+                    # Dump raw per-window/per-subject scores for offline ROC curves.
+                    if args.dump_dir:
+                        ev += [f"+dump_dir={args.dump_dir}", f"+dump_tag={dump_tag}"]
                     try:
                         out = sh(ev, env=dict(env, EVAL_CHECKPOINT=ckpt), capture=True)
                     except RuntimeError as e:
                         print(f"  !! eval ({sp}) failed, skipping: {e}", flush=True)
                         continue
                     print(out)
+                    # In dump-only mode we only want the npz files, not to disturb the results CSV.
+                    if args.dump_only:
+                        continue
                     for (rsplit, level), m in parse_results(out).items():
                         rows.append({"window_s": ws, "seed": seed, "variant": variant, "mode": mode,
                                      "split": rsplit, "level": level, "n": m["n"],
@@ -255,7 +284,11 @@ def main():
                         done.add((ws, seed, variant, mode, rsplit, level))
                     write_csv()
 
-    if not args.dry_run:
+    if args.dump_only:
+        if not args.dry_run:
+            print(f"\nDumped scores to {args.dump_dir}. Plot with scripts/plot_roc_variants.py --dump_dir "
+                  f"{args.dump_dir}.")
+    elif not args.dry_run:
         try:
             summarize(rows)
         except Exception as e:  # noqa: BLE001 - never let a summary bug lose a completed sweep

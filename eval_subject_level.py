@@ -200,6 +200,23 @@ def run(cfg: DictConfig):
     print("RESULT split={} level=subject n={} {}".format(
         split, len(subj_ids), " ".join(f"{k}={v:.4f}" for k, v in subj_m.items())))
 
+    # Optional: dump the raw per-window and per-subject scores (labels + probabilities) so ROC
+    # curves and other threshold sweeps can be drawn offline (the RESULT lines are only scalar
+    # summaries). One npz per (dump_tag, split); plot with scripts/plot_roc_variants.py.
+    dump_dir = cfg.get("dump_dir", None) or os.getenv("DUMP_DIR")
+    if dump_dir:
+        dump_tag = cfg.get("dump_tag", None) or os.getenv("DUMP_TAG") or "eval"
+        os.makedirs(dump_dir, exist_ok=True)
+        out_npz = os.path.join(dump_dir, f"{dump_tag}_{split}.npz")
+        np.savez_compressed(
+            out_npz,
+            win_prob=prob.astype(np.float32), win_y=y.astype(np.int8),
+            win_subject=np.asarray(subj), subj_id=np.asarray(subj_ids),
+            subj_prob=s_prob.astype(np.float32), subj_y=s_true.astype(np.int8),
+            win_per_subj=win_per_subj.astype(np.int32),
+        )
+        print(f"===> dumped scores to {out_npz} ({len(prob)} windows, {len(subj_ids)} subjects)")
+
     # Subject-level threshold calibration: pick the decision threshold on the held-out calib
     # split (max balanced accuracy), then re-score this split's subjects at that threshold. AUROC
     # is threshold-free (unchanged); balanced_acc / sensitivity / specificity move to a fair point.
