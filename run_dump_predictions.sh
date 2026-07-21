@@ -54,4 +54,5 @@ for WS in $WINDOWS; do
 done
 
 echo "Score dump done -> $DUMP_DIR"
-echo "Plot: python scripts/plot_roc_variants.py --dump_dir $DUMP_DIR --level subject --split test --variants $VARIANTS"
+echo "Plot ROC: python scripts/plot_roc_variants.py --dump_dir $DUMP_DIR --level subject --split test --variants $VARIANTS"
+echo "Plot PR:  python scripts/plot_roc_variants.py --curve pr --dump_dir $DUMP_DIR --level subject --split test --variants $VARIANTS"
