@@ -18,7 +18,13 @@ Run wherever the dump npz files and matplotlib/sklearn live (the HPC container).
 
     python scripts/plot_roc_variants.py --dump_dir <dir> --level subject --split test
     python scripts/plot_roc_variants.py --dump_dir <dir> --curve pr --level subject --split test
+    python scripts/plot_roc_variants.py --dump_dir <dir> --curve pr --sens_marker 0.85 --level subject
     python scripts/plot_roc_variants.py --dump_dir <dir> --curve pr --level window --window_s 30
+
+With ``--sens_marker S`` the PR plot marks a fixed sensitivity (recall = S, e.g. 0.85): a reference
+line at recall S, a dot on each variant's mean curve there, and ``P@S=mean±std`` (the precision /
+PPV at that sensitivity, over seeds) appended to the legend, i.e. "if we catch S of the epilepsy
+subjects, what fraction of the flagged subjects are truly epilepsy?".
 """
 
 from __future__ import annotations
@@ -95,8 +101,14 @@ def _curve(npz_path: Path, level: str, curve: str):
     return y_grid, float(average_precision_score(y, s)), prevalence
 
 
-def _panel(ax, recs_w, level, title, variants, curve):
-    """Draw the per-variant mean curve (+/-1 std band) for one window on ``ax``."""
+def _panel(ax, recs_w, level, title, variants, curve, sens_marker=None):
+    """Draw the per-variant mean curve (+/-1 std band) for one window on ``ax``.
+
+    ``sens_marker`` (a sensitivity = recall value, e.g. 0.85) adds, for the PR curve, a reference
+    line at that recall, a dot on each variant's mean curve there, and the precision at that
+    sensitivity (mean +/- std over seeds) in the legend. On the ROC curve sensitivity is the
+    y-axis, so it is drawn as a horizontal guide line instead (no per-variant precision).
+    """
     cfg = CURVE_CFG[curve]
     prevalences = []
     for variant in variants:
@@ -115,8 +127,15 @@ def _panel(ax, recs_w, level, title, variants, curve):
         mean_y = stack.mean(0)
         std_y = stack.std(0)
         color = VARIANT_COLOR.get(variant, None)
-        ax.plot(GRID, mean_y, color=color, lw=1.7, zorder=3,
-                label=f"{variant}  {cfg['metric']} {np.mean(scores):.3f}±{np.std(scores):.3f} (n={len(scores)})")
+        label = f"{variant}  {cfg['metric']} {np.mean(scores):.3f}±{np.std(scores):.3f} (n={len(scores)})"
+        # Precision at a fixed sensitivity (PR only): read each seed's precision at recall=marker,
+        # then mean +/- std, and drop a dot on the mean curve at that recall.
+        if sens_marker is not None and curve == "pr":
+            p_at = [float(np.interp(sens_marker, GRID, c)) for c in curves]
+            label += f"  P@{sens_marker:g}={np.mean(p_at):.3f}±{np.std(p_at):.3f}"
+            ax.plot([sens_marker], [float(np.interp(sens_marker, GRID, mean_y))],
+                    marker="o", color=color, ms=5, zorder=4)
+        ax.plot(GRID, mean_y, color=color, lw=1.7, zorder=3, label=label)
         ax.fill_between(GRID, np.clip(mean_y - std_y, 0, 1), np.clip(mean_y + std_y, 0, 1),
                         color=color, alpha=0.13, lw=0, zorder=2)
     # No-skill baseline: the ROC diagonal, or the positive-prevalence line for PR (mean over seeds).
@@ -125,6 +144,16 @@ def _panel(ax, recs_w, level, title, variants, curve):
     elif prevalences:
         base = float(np.mean(prevalences))
         ax.axhline(base, color="0.7", lw=0.8, ls="--", zorder=1, label=f"chance (prevalence {base:.2f})")
+    # Fixed-sensitivity reference line: recall (x) for PR, TPR (y) for ROC.
+    if sens_marker is not None:
+        if curve == "pr":
+            ax.axvline(sens_marker, color="0.4", lw=0.8, ls=":", zorder=1)
+            ax.text(sens_marker, 0.02, f"sens {sens_marker:g}", rotation=90, va="bottom",
+                    ha="right", fontsize=6, color="0.4")
+        else:
+            ax.axhline(sens_marker, color="0.4", lw=0.8, ls=":", zorder=1)
+            ax.text(0.98, sens_marker, f"sens {sens_marker:g}", va="bottom", ha="right",
+                    fontsize=6, color="0.4")
     ax.set_xlim(0, 1)
     ax.set_ylim(0, 1)
     ax.set_aspect("equal")
@@ -147,9 +176,15 @@ def main() -> None:
                    "default: every variant with dumps present.")
     p.add_argument("--window_s", type=float, default=None,
                    help="Restrict to one window length (Hz); default: one panel per window found.")
+    p.add_argument("--sens_marker", type=float, default=None,
+                   help="Mark a fixed sensitivity (=recall, e.g. 0.85). On the PR plot, annotate each "
+                   "variant's precision at that sensitivity (mean±std over seeds) and draw a reference line; "
+                   "on the ROC plot it is a horizontal guide line at that TPR.")
     p.add_argument("--out", default=None,
                    help="Output PNG (default: <dump_dir>/<curve>_variants_<level>_<split>.png).")
     args = p.parse_args()
+    if args.sens_marker is not None and not 0.0 < args.sens_marker < 1.0:
+        raise SystemExit(f"--sens_marker must be in (0, 1); got {args.sens_marker}.")
 
     recs = _load(args.dump_dir, args.split, args.mode)
     if not recs:
@@ -177,7 +212,7 @@ def main() -> None:
     axes = axes.ravel()
     for i, ws in enumerate(windows):
         recs_w = [r for r in recs if np.isclose(r[0], ws)]
-        _panel(axes[i], recs_w, args.level, f"{ws:g}s windows", plot_variants, args.curve)
+        _panel(axes[i], recs_w, args.level, f"{ws:g}s windows", plot_variants, args.curve, args.sens_marker)
     for ax in axes[len(windows):]:
         ax.axis("off")
 
@@ -188,9 +223,10 @@ def main() -> None:
     fig.tight_layout(rect=(0, 0, 1, 0.97))
 
     vtag = "" if args.variants is None else "_" + "-".join(VARIANT_SHORT[v] for v in plot_variants)
+    mtag = f"_sens{args.sens_marker:g}" if args.sens_marker is not None else ""
     suffix = f"_w{args.window_s:g}" if args.window_s is not None else ""
     out = (Path(args.out) if args.out else
-           Path(args.dump_dir) / f"{args.curve}_variants_{args.level}_{args.split}{vtag}{suffix}.png")
+           Path(args.dump_dir) / f"{args.curve}_variants_{args.level}_{args.split}{vtag}{mtag}{suffix}.png")
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out, dpi=140)
     plt.close(fig)
